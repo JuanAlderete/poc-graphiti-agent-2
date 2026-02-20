@@ -301,3 +301,16 @@ async def hybrid_search(
             _fmt_vec(embedding), text_query, limit,
         )
         return [dict(row) for row in rows]
+
+
+async def get_document_summary() -> List[Dict[str, Any]]:
+    """
+    Returns a summary of all documents in the database (from v_document_summary view).
+    """
+    async with get_db_connection() as conn:
+        try:
+            records = await conn.fetch("SELECT * FROM v_document_summary ORDER BY created_at DESC")
+            return [dict(r) for r in records]
+        except Exception as e:
+            logger.error(f"Error fetching document summary: {e}")
+            return []

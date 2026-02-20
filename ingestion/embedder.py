@@ -3,7 +3,11 @@ import logging
 from functools import lru_cache
 from typing import List, Tuple
 
+import warnings
 import google.generativeai as genai
+
+# Suppress the deprecation warning
+warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
 from openai import AsyncOpenAI
 
 from agent.config import settings

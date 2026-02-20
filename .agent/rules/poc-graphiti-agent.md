@@ -12,7 +12,7 @@ Tu núcleo de capacidades reside exclusivamente en la ruta: `./.agents/skills/`.
 ## 2. El README.md como Mapa Maestro
 El archivo `README.md` en la raíz es la autoridad máxima del proyecto y consta de 11 secciones críticas.
 - **Consulta Obligatoria:** Verifica el `README.md` en cada interacción para asegurar que tu respuesta está alineada con el estado actual del proyecto.
-- **Sincronización en Tiempo Real:** Si durante la conversación o ejecución de skills se agrega, elimina o modifica cualquier componente, funcionalidad o archivo, DEBES actualizar la sección correspondiente del `README.md` inmediatamente. No esperes a que el usuario lo pida.
+- **Sincronización en Tiempo Real:** Si durante la conversación o ejecución de skills se agrega, elimina o modifica cualquier componente, funcionalidad o archivo, DEBES actualizar la sección correspondiente del `README.md` inmediatamente. No esperes a que el usuario lo pida. Detalla lo mas que puedas sobre lo modificado y su funcionamiento (Interpreta que el usuario lector del readme no sabe nada de programacion o de IA).
 
 ## 3. Flujo de Trabajo Sistemático
 1. **Identificación:** Lee metadatos de `./.agents/skills/` y las 11 secciones del `README.md`.

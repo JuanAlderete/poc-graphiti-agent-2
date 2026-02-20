@@ -521,15 +521,18 @@ Además de las tablas estándar, define:
 streamlit run dashboard/app.py
 ```
 
-El dashboard tiene cuatro tabs:
+El dashboard tiene **seis tabs** principales:
 
-**Ingesta** — Muestra los registros de `ingesta_log.csv`. Gráfico de torta con distribución de costos por archivo. Tabla con costo, tiempo y chunks por documento.
+1.  **📥 Ingesta**: Trigger para procesar nuevos documentos. Opción `--skip-graphiti` para iteración rápida.
+2.  **🧠 Knowledge Base**: Visor de la base de datos. Muestra todos los documentos ingestados, conteo de chunks y metadata extraída. Permite filtrar por nombre.
+3.  **🔍 Búsqueda**: Interfaz para probar Vector, Graph y Hybrid search. Incluye un **Debug Mode** para inspeccionar el JSON crudo y los scores RRF.
+4.  **✨ Generación**: Templates predefinidos (Email, Historia, Reel) y un nuevo **Modo Custom** para experimentar con prompts libres.
+5.  **📊 Analytics**: Métricas de costo total y gráficos de evolución temporal por tipo de operación (Ingesta, Búsqueda, Generación).
+6.  **📈 Proyecciones**: Calculadora de ROI y estimación de costos mensuales según volumen esperado.
 
-**Búsqueda** — Registros de `busqueda_log.csv`. Histograma de latencias. Comparación de costos por tipo de búsqueda (vector vs. hybrid vs. graph).
-
-**Generación** — Registros de `generacion_log.csv`. Costo por formato de contenido (email, reel, historia).
-
-**Proyecciones** — Inputs configurables (docs/mes, búsquedas/mes, piezas/mes) que calculan el gasto proyectado mensual y anual. Muestra la decisión GO/OPTIMIZE/STOP según los umbrales definidos.
+**Acciones de la Sidebar**:
+- **🗑️ Clear Logs & DB**: Limpieza total para reiniciar pruebas.
+- **💧 Re-hydrate Graph**: Forza la ingesta de documentos pendientes desde Postgres hacia Neo4j sin re-procesar embeddings.
 
 ---
 

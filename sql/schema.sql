@@ -142,8 +142,8 @@ BEGIN
     combined AS (
         SELECT
             COALESCE(v.id, t.id) AS id,
-            COALESCE(1.0 / (rrf_k + v.rank), 0.0)
-                + COALESCE(1.0 / (rrf_k + t.rank), 0.0) AS rrf_score,
+            (COALESCE(1.0 / (rrf_k + v.rank), 0.0)
+                + COALESCE(1.0 / (rrf_k + t.rank), 0.0))::float AS rrf_score,
             v.similarity AS v_sim,
             t.similarity AS t_sim
         FROM vector_results v

@@ -9,7 +9,7 @@ import streamlit as st
 # FIXED: patch the event loop so asyncio.run / await work inside Streamlit
 nest_asyncio.apply()
 
-from agent.db_utils import DatabasePool
+from agent.db_utils import DatabasePool, get_document_summary
 from agent.tools import graph_search_tool, hybrid_search_tool, vector_search_tool
 from poc.content_generator import get_content_generator
 from poc.logging_utils import (
@@ -23,6 +23,7 @@ from poc.logging_utils import (
 )
 from poc.prompts import email, historia, reel_cta
 from poc.run_poc import run_ingestion
+from poc.hydrate_graph import hydrate_graph
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -78,13 +79,22 @@ with st.sidebar:
         time.sleep(0.8)
         st.rerun()
 
+    if st.button("💧 Re-hydrate Graph (Force)", help="Push all docs to Neo4j"):
+        with st.spinner("Hydrating Graph from Postgres..."):
+            try:
+                run_async(hydrate_graph(reset_flags=True))
+                st.success("Hydration Complete!")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_ingest, tab_search, tab_gen, tab_analytics, tab_projections = st.tabs([
+tab_ingest, tab_kb, tab_search, tab_gen, tab_analytics, tab_projections = st.tabs([
     "📥 Ingestion",
+    "🧠 Knowledge Base",
     "🔍 Search",
     "✨ Generation",
     "📊 Analytics",
@@ -119,7 +129,55 @@ with tab_ingest:
                     st.error(f"Error: {exc}")
 
 
-# ── TAB 2: SEARCH ───────────────────────────────────────────────────────────
+
+# ── TAB 2: KNOWLEDGE BASE ───────────────────────────────────────────────────
+with tab_kb:
+    st.header("🧠 Knowledge Base")
+    if st.button("🔄 Refresh DB", key="refresh_kb"):
+        st.rerun()
+
+    try:
+        docs = run_async(get_document_summary())
+        if not docs:
+            st.info("No documents found in database.")
+        else:
+            df_docs = pd.DataFrame(docs)
+            # Display metrics
+            total_docs = len(df_docs)
+            total_chunks = df_docs["chunk_count"].sum() if "chunk_count" in df_docs.columns else 0
+            
+            c1, c2 = st.columns(2)
+            c1.metric("Total Documents", total_docs)
+            c2.metric("Total Chunks", total_chunks)
+            
+            st.divider()
+            
+            # Search filter
+            filter_txt = st.text_input("Filter by filename/title", "", key="kb_filter")
+            if filter_txt:
+                df_docs = df_docs[
+                    df_docs["title"].str.contains(filter_txt, case=False, na=False) |
+                    df_docs["filepath"].str.contains(filter_txt, case=False, na=False)
+                ]
+
+            st.dataframe(
+                df_docs,
+                column_config={
+                    "created_at": st.column_config.DatetimeColumn("Ingested At", format="D MMM YYYY, h:mm a"),
+                    "metadata": st.column_config.Column("Metadata"),
+                    "chunk_count": st.column_config.NumberColumn("Chunks"),
+                    "filepath": st.column_config.TextColumn("File Path"),
+                    "title": st.column_config.TextColumn("Title"),
+                },
+                use_container_width=True,
+                hide_index=True,
+            )
+    except Exception as e:
+        st.error(f"Error fetching knowledge base: {e}")
+
+
+# ── TAB 3: SEARCH ───────────────────────────────────────────────────────────
+
 with tab_search:
     st.header("Graph & Vector Search")
 
@@ -140,11 +198,18 @@ with tab_search:
                     results = run_async(hybrid_search_tool(query))
 
                 st.subheader(f"{len(results)} result(s)")
-                # FIXED: render results as cards, not as list repr
+                
+                # Debug Mode Toggle
+                debug_mode = st.checkbox("Show Raw JSON (Debug Mode)", value=False)
+
                 for i, r in enumerate(results, 1):
                     with st.expander(f"#{i} — score {r.score:.3f} [{r.source}]"):
-                        st.write(r.content)
-                        if r.metadata:
+                        st.markdown(r.content)
+                        if debug_mode:
+                             st.caption("Raw Result Data:")
+                             st.json(r.__dict__)
+                        elif r.metadata:
+                            st.caption("Metadata:")
                             st.json(r.metadata)
             except Exception as exc:
                 st.error(f"Search failed: {exc}")
@@ -154,7 +219,7 @@ with tab_search:
 with tab_gen:
     st.header("Content Generation")
 
-    template_type = st.selectbox("Select Template", ["Cold Email", "Startup Story", "Instagram Reel"])
+    template_type = st.selectbox("Select Template", ["Cold Email", "Startup Story", "Instagram Reel", "Custom"])
 
     prompt = system_prompt = ""
     formato = "text"
@@ -191,6 +256,12 @@ with tab_gen:
         system_prompt = reel_cta.SYSTEM_PROMPT
         prompt = reel_cta.PROMPT_TEMPLATE.format(topic=topic, context=context, cta=cta)
         formato = "reel_cta"
+
+    elif template_type == "Custom":
+        topic = st.text_input("Topic/Title", "Mi Nuevo Contenido")
+        system_prompt = st.text_area("System Prompt", "Eres un experto en marketing digital.")
+        prompt = st.text_area("Prompt", "Escribe un post sobre...", height=150)
+        formato = "custom"
 
     if st.button("✨ Generate Content"):
         with st.spinner("Generating…"):
@@ -230,6 +301,29 @@ with tab_analytics:
     c2.metric("Files Ingested", len(df_ingest) if not df_ingest.empty else 0)
     c3.metric("Searches Run", len(df_search) if not df_search.empty else 0)
     c4.metric("Pieces Generated", len(df_gen) if not df_gen.empty else 0)
+    st.divider()
+
+    st.divider()
+
+    st.subheader("Cost Evolution")
+    cost_data = []
+    if not df_ingest.empty and "timestamp" in df_ingest.columns:
+        for _, r in df_ingest.iterrows():
+            cost_data.append({"time": r["timestamp"], "cost": r.get("costo_total_usd", 0), "type": "Ingestion"})
+    if not df_search.empty and "timestamp" in df_search.columns:
+        for _, r in df_search.iterrows():
+            cost_data.append({"time": r["timestamp"], "cost": r.get("costo_total_usd", 0), "type": "Search"})
+    if not df_gen.empty and "timestamp" in df_gen.columns:
+        for _, r in df_gen.iterrows():
+            cost_data.append({"time": r["timestamp"], "cost": r.get("costo_usd", 0), "type": "Generation"})
+            
+    if cost_data:
+        df_cost = pd.DataFrame(cost_data)
+        df_cost["time"] = pd.to_datetime(df_cost["time"], unit="s")
+        st.scatter_chart(df_cost, x="time", y="cost", color="type")
+    else:
+        st.info("No cost data to display.")
+
     st.divider()
 
     log1, log2, log3 = st.tabs(["Ingestion Log", "Search Log", "Generation Log"])
