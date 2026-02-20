@@ -19,34 +19,31 @@ from graphiti_core.prompts.models import Message
 
 logger = logging.getLogger(__name__)
 
-_MAX_RATE_LIMIT_RETRIES = 5
+_MAX_RETRIES = 5
 _RETRY_BASE_SECONDS = 10
 
-# FIX BUG 2 (iteracion 3): 16384 para cubrir reasoning + JSON output.
-# Los prompts de graphiti-core llegan a ~20k tokens.
-# El reasoning consume 8000-12000 tokens en esos casos.
-# El JSON de output necesita ~300-500 tokens adicionales.
-# Total worst-case: ~12500 -> 16384 da margen seguro.
-_MAX_TOKENS_REASONING_MODELS = 16384
+# Para gpt-5-* y o1-*: reasoning consume ~8-12k tokens antes del output.
+# Con prompt ~20k: reasoning ~8-12k + JSON output ~500 = ~12500 worst case.
+# 16384 cubre con margen; tokens no usados no se cobran.
+_MAX_TOKENS_REASONING = 16384
 
 
 class CustomOpenAIClient(OpenAIClient):
     """
-    Subclass de OpenAIClient para modelos gpt-5-* y o1-*.
+    Drop-in replacement para OpenAIClient de graphiti-core.
 
-    1. max_completion_tokens=16384 para cubrir reasoning interno.
-    2. small_model = medium_model (evita gpt-4.1-nano con limite 200k TPM).
-    3. Retry con backoff ante 429.
+    Registrar en graph_utils.py:
+        from agent.custom_openai_client import CustomOpenAIClient
+        llm_client = CustomOpenAIClient(config=LLMConfig(...))
     """
 
     def __init__(self, config: LLMConfig) -> None:
         super().__init__(config)
-
-        original_small = self.small_model or DEFAULT_SMALL_MODEL
-        if self.model and self.model != original_small:
+        original = self.small_model or DEFAULT_SMALL_MODEL
+        if self.model and self.model != original:
             logger.info(
-                "CustomOpenAIClient: overriding small_model '%s' -> '%s'",
-                original_small, self.model,
+                "CustomOpenAIClient: small_model '%s' -> '%s'",
+                original, self.model,
             )
             self.small_model = self.model
 
@@ -58,10 +55,11 @@ class CustomOpenAIClient(OpenAIClient):
         model_size: ModelSize = ModelSize.medium,
     ) -> dict[str, typing.Any]:
 
-        if model_size == ModelSize.small:
-            model = self.small_model or DEFAULT_SMALL_MODEL
-        else:
-            model = self.model or DEFAULT_MODEL
+        model = (
+            self.small_model or DEFAULT_SMALL_MODEL
+            if model_size == ModelSize.small
+            else self.model or DEFAULT_MODEL
+        )
 
         openai_messages: list[ChatCompletionMessageParam] = []
         for m in messages:
@@ -71,66 +69,54 @@ class CustomOpenAIClient(OpenAIClient):
             elif m.role == "system":
                 openai_messages.append({"role": "system", "content": m.content})
 
-        # gpt-5-* y o1-* son reasoning models:
-        # - usan max_completion_tokens (no max_tokens)
-        # - no aceptan temperature
-        # - consumen reasoning_tokens antes de generar output visible
-        is_reasoning_model = model.startswith("o1-") or model.startswith("gpt-5")
+        is_reasoning = model.startswith("o1-") or model.startswith("gpt-5")
 
-        if is_reasoning_model:
-            effective_max_tokens = _MAX_TOKENS_REASONING_MODELS
-        else:
-            effective_max_tokens = max_tokens or self.max_tokens or DEFAULT_MAX_TOKENS
+        effective_tokens = (
+            _MAX_TOKENS_REASONING if is_reasoning
+            else (max_tokens or self.max_tokens or DEFAULT_MAX_TOKENS)
+        )
 
         kwargs: dict[str, typing.Any] = {
             "model": model,
             "messages": openai_messages,
             "response_format": response_model,
         }
-
-        if not is_reasoning_model:
+        if not is_reasoning:
             kwargs["temperature"] = self.temperature
-
-        if is_reasoning_model:
-            kwargs["max_completion_tokens"] = effective_max_tokens
+        if is_reasoning:
+            kwargs["max_completion_tokens"] = effective_tokens
         else:
-            kwargs["max_tokens"] = effective_max_tokens
+            kwargs["max_tokens"] = effective_tokens
 
-        last_error: Exception | None = None
-        for attempt in range(_MAX_RATE_LIMIT_RETRIES):
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
             try:
                 response = await self.client.beta.chat.completions.parse(**kwargs)
-                response_object = response.choices[0].message
-
-                if response_object.parsed:
-                    return response_object.parsed.model_dump()
-                elif response_object.refusal:
-                    raise RefusalError(response_object.refusal)
-                else:
-                    raise Exception(
-                        f"Invalid response from LLM: {response_object.model_dump()}"
-                    )
+                msg = response.choices[0].message
+                if msg.parsed:
+                    return msg.parsed.model_dump()
+                if msg.refusal:
+                    raise RefusalError(msg.refusal)
+                raise Exception(f"Unexpected LLM response: {msg.model_dump()}")
 
             except openai.LengthFinishReasonError as e:
                 raise Exception(f"Output length exceeded: {e}") from e
 
             except openai.RateLimitError as e:
-                last_error = e
+                last_exc = e
                 wait = _RETRY_BASE_SECONDS * (2 ** attempt)
-                if attempt < _MAX_RATE_LIMIT_RETRIES - 1:
+                if attempt < _MAX_RETRIES - 1:
                     logger.warning(
-                        "Rate limit on '%s' (attempt %d/%d). Waiting %ds...",
-                        model, attempt + 1, _MAX_RATE_LIMIT_RETRIES, wait,
+                        "429 en '%s' (intento %d/%d). Esperando %ds...",
+                        model, attempt + 1, _MAX_RETRIES, wait,
                     )
                     await asyncio.sleep(wait)
                 else:
-                    logger.error(
-                        "Rate limit persists after %d attempts.", _MAX_RATE_LIMIT_RETRIES
-                    )
+                    logger.error("Rate limit persiste tras %d intentos.", _MAX_RETRIES)
                     raise RateLimitError from e
 
             except Exception as e:
-                logger.error("LLM response error: %s", e)
+                logger.error("Error LLM: %s", e)
                 raise
 
-        raise RateLimitError from last_error
+        raise RateLimitError from last_exc

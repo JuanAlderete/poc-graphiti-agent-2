@@ -12,20 +12,17 @@ from poc.token_tracker import tracker
 
 logger = logging.getLogger(__name__)
 
-# Limites para modelos NO reasoning (gpt-4o-mini, etc.)
-_MAX_TOKENS_DEFAULT = 600
 _MAX_TOKENS_BY_FORMAT = {
     "email": 300,
     "reel_cta": 250,
     "reel_lead_magnet": 300,
     "historia": 500,
 }
+_MAX_TOKENS_DEFAULT = 600
 
-# FIX P3: Para reasoning models (gpt-5-*, o1-*), usar un budget alto.
-# El reasoning consume 1000-2000 tokens para prompts de generacion.
-# El output deseado (email, reel) es ~300-500 tokens.
-# Total necesario: ~2500 tokens -> 3000 da margen seguro.
-_MAX_TOKENS_REASONING_GEN = 3000
+# Para reasoning models (gpt-5-*, o1-*): reasoning consume ~1500-2000 tokens
+# antes de generar output. Sin este valor alto el output queda vacío.
+_MAX_TOKENS_REASONING = 3000
 
 
 class ContentGenerator(ABC):
@@ -39,13 +36,13 @@ class ContentGenerator(ABC):
         tema: str = "unknown",
         max_tokens: Optional[int] = None,
     ) -> str:
-        """Genera contenido y registra uso. Retorna el string generado."""
+        pass
 
 
 class OpenAIContentGenerator(ContentGenerator):
-    def __init__(self) -> None:
+    def __init__(self):
         self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-        self.model = settings.DEFAULT_MODEL
+        self.model = settings.DEFAULT_MODEL  # usa lo configurado en .env
 
     async def generate(
         self,
@@ -57,17 +54,15 @@ class OpenAIContentGenerator(ContentGenerator):
         max_tokens: Optional[int] = None,
     ) -> str:
         start_time = time.time()
-        op_id = f"gen_openai_{start_time:.3f}"
+        op_id = f"gen_openai_{int(start_time * 1000)}"
         tracker.start_operation(op_id, "generation_openai")
 
-        # gpt-5-* y o1-* son reasoning models
         is_reasoning = self.model.startswith("o1-") or self.model.startswith("gpt-5")
 
         if max_tokens:
             token_limit = max_tokens
         elif is_reasoning:
-            # FIX P3: budget alto para reasoning models en generacion
-            token_limit = _MAX_TOKENS_REASONING_GEN
+            token_limit = _MAX_TOKENS_REASONING
         else:
             token_limit = _MAX_TOKENS_BY_FORMAT.get(formato, _MAX_TOKENS_DEFAULT)
 
@@ -77,7 +72,7 @@ class OpenAIContentGenerator(ContentGenerator):
                 messages.append({"role": "system", "content": system_prompt.strip()})
             messages.append({"role": "user", "content": prompt})
 
-            kwargs: dict = {"model": self.model, "messages": messages}
+            kwargs = {"model": self.model, "messages": messages}
             if is_reasoning:
                 kwargs["max_completion_tokens"] = token_limit
             else:
@@ -87,11 +82,9 @@ class OpenAIContentGenerator(ContentGenerator):
             content = response.choices[0].message.content or ""
             usage = response.usage
 
-            # Log de advertencia si el output sigue vacio (para diagnostico)
             if not content.strip():
                 logger.warning(
-                    "Generation returned empty content for formato='%s'. "
-                    "finish_reason=%s, completion_tokens=%d",
+                    "Generacion vacia para formato='%s'. finish_reason=%s, tokens=%d",
                     formato,
                     response.choices[0].finish_reason,
                     usage.completion_tokens if usage else 0,
@@ -124,13 +117,13 @@ class OpenAIContentGenerator(ContentGenerator):
             return content
 
         except Exception:
-            logger.exception("OpenAI generation failed")
+            logger.exception("OpenAI Generation failed")
             tracker.end_operation(op_id)
             raise
 
 
 class GeminiContentGenerator(ContentGenerator):
-    def __init__(self) -> None:
+    def __init__(self):
         genai.configure(api_key=settings.GEMINI_API_KEY)
         self.model_name = settings.DEFAULT_MODEL
 
@@ -144,13 +137,13 @@ class GeminiContentGenerator(ContentGenerator):
         max_tokens: Optional[int] = None,
     ) -> str:
         start_time = time.time()
-        op_id = f"gen_gemini_{start_time:.3f}"
+        op_id = f"gen_gemini_{int(start_time * 1000)}"
         tracker.start_operation(op_id, "generation_gemini")
 
         token_limit = max_tokens or _MAX_TOKENS_BY_FORMAT.get(formato, _MAX_TOKENS_DEFAULT)
 
         try:
-            generation_config = genai.types.GenerationConfig(max_output_tokens=token_limit)
+            gen_config = genai.types.GenerationConfig(max_output_tokens=token_limit)
             model = genai.GenerativeModel(
                 self.model_name,
                 system_instruction=(
@@ -158,9 +151,11 @@ class GeminiContentGenerator(ContentGenerator):
                     if system_prompt and system_prompt.strip()
                     else None
                 ),
-                generation_config=generation_config,
+                generation_config=gen_config,
             )
-            response = await model.generate_content_async(prompt)
+
+            full_prompt = prompt
+            response = await model.generate_content_async(full_prompt)
             content = response.text or ""
 
             usage = response.usage_metadata
@@ -191,13 +186,12 @@ class GeminiContentGenerator(ContentGenerator):
             return content
 
         except Exception:
-            logger.exception("Gemini generation failed")
+            logger.exception("Gemini Generation failed")
             tracker.end_operation(op_id)
             raise
 
 
 def get_content_generator() -> ContentGenerator:
-    """Retorna el ContentGenerator apropiado para el proveedor configurado."""
     if settings.LLM_PROVIDER.lower() == "gemini":
         return GeminiContentGenerator()
     return OpenAIContentGenerator()
