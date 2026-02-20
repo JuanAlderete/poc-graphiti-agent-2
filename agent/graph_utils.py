@@ -37,14 +37,15 @@ class GraphClient:
                     embedder=GeminiEmbedder(),
                 )
             else:
+                from agent.custom_openai_client import CustomOpenAIClient
                 from graphiti_core.llm_client.config import LLMConfig
-                from graphiti_core.llm_client.openai_client import OpenAIClient
-                logger.info("Initializing Graphiti with OpenAI (%s)…", settings.DEFAULT_MODEL)
+                
+                logger.info("Initializing Graphiti with CustomOpenAI (%s)…", settings.DEFAULT_MODEL)
                 client = Graphiti(
                     uri=settings.NEO4J_URI,
                     user=settings.NEO4J_USER,
                     password=settings.NEO4J_PASSWORD,
-                    llm_client=OpenAIClient(
+                    llm_client=CustomOpenAIClient(
                         config=LLMConfig(
                             api_key=settings.OPENAI_API_KEY,
                             model=settings.DEFAULT_MODEL,

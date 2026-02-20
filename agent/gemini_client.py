@@ -2,12 +2,12 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Type
 
-import google.generativeai as genai
-from pydantic import BaseModel
 import warnings
 
-# Suppress the "support has ended" warning from google.generativeai
+# Suppress the "support has ended" warning from google.generativeai BEFORE import
 warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
+
+import google.generativeai as genai
 
 from agent.config import settings
 from graphiti_core.llm_client.client import LLMClient

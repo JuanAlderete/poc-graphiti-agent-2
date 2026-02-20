@@ -4,10 +4,11 @@ from functools import lru_cache
 from typing import List, Tuple
 
 import warnings
-import google.generativeai as genai
 
-# Suppress the deprecation warning
+# Suppress the deprecation warning BEFORE importing the module
 warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
+
+import google.generativeai as genai
 from openai import AsyncOpenAI
 
 from agent.config import settings

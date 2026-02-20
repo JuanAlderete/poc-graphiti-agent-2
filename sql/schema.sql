@@ -134,7 +134,7 @@ BEGIN
             ROW_NUMBER() OVER (
                 ORDER BY ts_rank_cd(c.content_tsvector, plainto_tsquery('english', query_text)) DESC
             ) AS rank,
-            ts_rank_cd(c.content_tsvector, plainto_tsquery('english', query_text)) AS similarity
+            ts_rank_cd(c.content_tsvector, plainto_tsquery('english', query_text))::float8 AS similarity
         FROM chunks c
         WHERE c.content_tsvector @@ plainto_tsquery('english', query_text)
         LIMIT match_count * 2
