@@ -43,7 +43,7 @@ async def hydrate_graph(
         docs = await get_documents_missing_from_graph(limit=limit)
 
     if not docs:
-        logger.info("✅ No hay documentos pendientes. El grafo está al día.")
+        logger.info("[OK] No hay documentos pendientes. El grafo está al día.")
         return
 
     logger.info("Documentos a hidratar: %d", len(docs))
@@ -69,7 +69,8 @@ async def hydrate_graph(
     await GraphClient.ensure_schema()
 
     # ── Hidratación con concurrencia controlada ───────────────────────────────
-    concurrency = 3
+    # ── Hidratación con concurrencia controlada ───────────────────────────────
+    concurrency = 1  # Reduced to 1 to avoid 429s
     sem = asyncio.Semaphore(concurrency)
     total_cost = 0.0
     processed_ids: set[str] = set()  # FIXED: track éxitos por ID, no por costo
@@ -85,6 +86,8 @@ async def hydrate_graph(
         doc_id = doc["id"]
 
         async with sem:
+            # Add small delay to space out requests
+            await asyncio.sleep(0.5)
             meta = doc.get("metadata", {})
             if isinstance(meta, str):
                 import json
@@ -158,11 +161,11 @@ async def hydrate_graph(
     avg_cost = total_cost / max(success_count, 1)
     monthly_projection = avg_cost * 250
     if monthly_projection < 100:
-        logger.info("✅ GO — Proyección mensual (250 docs): $%.2f (< $100)", monthly_projection)
+        logger.info("[GO] Proyección mensual (250 docs): $%.2f (< $100)", monthly_projection)
     elif monthly_projection < 200:
-        logger.warning("⚠️  OPTIMIZE — Proyección mensual: $%.2f ($100–$200)", monthly_projection)
+        logger.warning("[OPTIMIZE] Proyección mensual: $%.2f ($100–$200)", monthly_projection)
     else:
-        logger.error("🛑 STOP — Proyección mensual: $%.2f (> $200)", monthly_projection)
+        logger.error("[STOP] Proyección mensual: $%.2f (> $200)", monthly_projection)
 
 
 if __name__ == "__main__":

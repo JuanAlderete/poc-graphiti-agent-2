@@ -310,7 +310,16 @@ async def get_document_summary() -> List[Dict[str, Any]]:
     async with get_db_connection() as conn:
         try:
             records = await conn.fetch("SELECT * FROM v_document_summary ORDER BY created_at DESC")
-            return [dict(r) for r in records]
+            # Convert asyncpg UUID objects to strings for Streamlit/Arrow compatibility
+            result = []
+            for r in records:
+                d = dict(r)
+                if 'id' in d:
+                    d['id'] = str(d['id'])
+                if 'document_id' in d:
+                    d['document_id'] = str(d['document_id'])
+                result.append(d)
+            return result
         except Exception as e:
             logger.error(f"Error fetching document summary: {e}")
             return []

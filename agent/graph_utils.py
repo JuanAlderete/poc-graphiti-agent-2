@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from datetime import datetime
@@ -15,7 +16,17 @@ _GRAPHITI_OUTPUT_RATIO = 0.30  # ratio conservador tokens-out / tokens-in
 
 class GraphClient:
     _client: Optional[Graphiti] = None
-    _initialized: bool = False  # Flag: build_indices_and_constraints ya fue llamado
+    _initialized: bool = False
+    _loop: Optional[asyncio.AbstractEventLoop] = None  # Track the loop used for init
+
+    @classmethod
+    def _check_loop(cls):
+        """Reset client if event loop changes (e.g. Streamlit rerun)."""
+        current_loop = asyncio.get_running_loop()
+        if cls._loop and cls._loop is not current_loop:
+             logger.warning("GraphClient loop changed — resetting client.")
+             cls.reset()
+        cls._loop = current_loop
 
     @classmethod
     def _build_client(cls) -> Graphiti:
@@ -70,6 +81,8 @@ class GraphClient:
 
         Las siguientes veces retorna el cliente cacheado directamente.
         """
+
+        cls._check_loop()
         if cls._client is None:
             cls._client = cls._build_client()
 

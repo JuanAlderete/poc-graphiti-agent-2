@@ -299,7 +299,7 @@ async def ingest_directory(directory: str, skip_graphiti: bool = False) -> None:
         logger.warning("No .md files found in '%s'.", directory)
         return
 
-    concurrency = 3 if not skip_graphiti else 5
+    concurrency = 2 if not skip_graphiti else 5
     sem = asyncio.Semaphore(concurrency)
     t0 = time.time()
 
