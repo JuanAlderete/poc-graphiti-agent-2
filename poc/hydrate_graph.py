@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Any
 
+from agent.config import settings
 from agent.db_utils import (
     DatabasePool,
     get_all_documents,
@@ -11,6 +12,8 @@ from agent.db_utils import (
     mark_document_graph_ingested,
 )
 from agent.graph_utils import GraphClient
+from poc.cost_calculator import calculate_cost
+from poc.token_tracker import tracker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -34,7 +37,7 @@ async def hydrate_graph(
 
     # ── Obtener documentos pendientes ─────────────────────────────────────────
     if reset_flags:
-        logger.info("--reset-flags: fetching ALL documents regardless of graph_ingested flag.")
+        logger.info("--reset-flags activo: procesando TODOS los documentos.")
         docs = await get_all_documents(limit=limit)
     else:
         docs = await get_documents_missing_from_graph(limit=limit)
@@ -45,6 +48,7 @@ async def hydrate_graph(
 
     logger.info("Documentos a hidratar: %d", len(docs))
 
+    # ── Dry run ───────────────────────────────────────────────────────────────
     if dry_run:
         logger.info("=== DRY RUN — no se gastarán tokens ===")
         for doc in docs:
@@ -53,112 +57,108 @@ async def hydrate_graph(
             people = meta.get("detected_people", [])
             companies = meta.get("detected_companies", [])
             logger.info(
-                "  DOC: %s\n  CONTEXT: %s\n  People: %s | Companies: %s",
-                doc["source"], context, people[:5], companies[:5],
+                "  DOC: %s\n    CONTEXT: %s\n    People: %s | Companies: %s",
+                doc["source"], context[:120], people[:5], companies[:5],
             )
         logger.info("=== DRY RUN completado (%d docs revisados) ===", len(docs))
         return
 
-    # ── Asegurar índices en Neo4j ─────────────────────────────────────────────
+    # ── Inicializar Graphiti (build_indices_and_constraints) ──────────────────
+    # Esto crea los índices necesarios en Neo4j una sola vez.
+    logger.info("Initializing Graphiti and ensuring Neo4j schema…")
     await GraphClient.ensure_schema()
 
     # ── Hidratación con concurrencia controlada ───────────────────────────────
-    concurrency = 3  # conservador para no spikear el rate limit del LLM
+    concurrency = 3
     sem = asyncio.Semaphore(concurrency)
     total_cost = 0.0
-    success_count = 0
+    processed_ids: set[str] = set()  # FIXED: track éxitos por ID, no por costo
     error_count = 0
     t0 = time.time()
 
-    async def _process_doc(doc: dict[str, Any]) -> float:
-        """Procesa un único doc. Retorna costo estimado o 0.0 en error."""
+    async def _process_doc(doc: dict[str, Any]) -> tuple[str, float]:
+        """
+        Procesa un único doc.
+        Retorna (doc_id, costo_estimado) o lanza excepción.
+        """
         source = doc.get("title") or doc.get("source", "unknown")
+        doc_id = doc["id"]
+
         async with sem:
-            try:
-                meta = doc.get("metadata", {})
-                if isinstance(meta, str):
-                    import json
-                    try:
-                        meta = json.loads(meta)
-                    except Exception:
-                        meta = {}
+            meta = doc.get("metadata", {})
+            if isinstance(meta, str):
+                import json
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
 
-                content = doc.get("content", "")
-                if not content.strip():
-                    logger.warning("Skipping %s — empty content.", source)
-                    return 0.0
+            content = doc.get("content", "")
+            if not content.strip():
+                logger.warning("Skipping %s — empty content.", source)
+                return doc_id, 0.0
 
-                # Usar el contexto pre-calculado en Fase 1 (el gran beneficio de esta arquitectura)
-                graphiti_context = meta.get("graphiti_ready_context")
+            graphiti_context = meta.get("graphiti_ready_context")
 
-                # Log de lo que vamos a inyectar
-                if graphiti_context:
-                    logger.info("Hydrating: %s | Context: %s…", source, graphiti_context[:80])
-                else:
-                    logger.warning(
-                        "Hydrating: %s | No pre-calculated context — Graphiti will infer entities "
-                        "(costs more tokens). Consider re-ingesting with the new pipeline.",
-                        source,
-                    )
-
-                await GraphClient.add_episode(
-                    content=content,
-                    source_reference=doc.get("source", source),
-                    source_description=graphiti_context,
+            if graphiti_context:
+                logger.info("Hydrating: %s | Context: %.80s…", source, graphiti_context)
+            else:
+                logger.warning(
+                    "Hydrating: %s | No pre-calculated context. "
+                    "Re-ingestar con el pipeline actualizado mejora la calidad.",
+                    source,
                 )
 
-                # Marcar como hidratado para no reprocesar en runs futuras
-                await mark_document_graph_ingested(doc["id"])
+            await GraphClient.add_episode(
+                content=content,
+                source_reference=doc.get("source", source),
+                source_description=graphiti_context,
+            )
 
-                # Obtener costo estimado del último episodio (loggeado en graph_utils)
-                # No tenemos acceso directo al costo aquí sin refactorizar más,
-                # así que estimamos basándonos en el tamaño del contenido.
-                from poc.token_tracker import tracker
-                estimated_tokens = tracker.estimate_tokens(content)
-                from poc.cost_calculator import calculate_cost
-                from agent.config import settings
-                cost = calculate_cost(
-                    int(estimated_tokens * 1.30),  # input + 30% output
-                    int(estimated_tokens * 0.30),
-                    settings.DEFAULT_MODEL,
-                )
-                return cost
+            # Marcar como hidratado para reanudar si se interrumpe
+            await mark_document_graph_ingested(doc_id)
 
-            except Exception as e:
-                logger.error("Failed to hydrate %s: %s", source, e)
-                return 0.0
+            # Estimación de costo para el resumen final
+            est_tokens_in = tracker.estimate_tokens(content)
+            est_tokens_out = int(est_tokens_in * 0.30)
+            cost = calculate_cost(est_tokens_in, est_tokens_out, settings.DEFAULT_MODEL)
 
-    # Ejecutar en paralelo con semáforo
-    results = await asyncio.gather(*(_process_doc(doc) for doc in docs), return_exceptions=True)
+            return doc_id, cost
+
+    # Ejecutar en paralelo
+    results = await asyncio.gather(
+        *(_process_doc(doc) for doc in docs),
+        return_exceptions=True,
+    )
 
     for r in results:
         if isinstance(r, Exception):
             error_count += 1
             logger.error("Hydration task error: %s", r)
         else:
-            cost_val = float(r) if r is not None else 0.0  # type: ignore
-            if cost_val > 0:
-                success_count += 1
+            doc_id, cost_val = r  # type: ignore[misc]
+            processed_ids.add(doc_id)
             total_cost += cost_val
 
     elapsed = time.time() - t0
+    success_count = len(processed_ids)  # FIXED: count basado en IDs procesados
 
     # ── Resumen ───────────────────────────────────────────────────────────────
-    logger.info("=" * 50)
+    logger.info("=" * 55)
     logger.info("HYDRATION COMPLETE")
-    logger.info("  Documents processed : %d", len(docs))
-    logger.info("  Success             : %d", success_count)
-    logger.info("  Errors              : %d", error_count)
-    logger.info("  Total time          : %.1fs", elapsed)
-    logger.info("  Estimated cost      : $%.4f", total_cost)
-    logger.info("  Avg cost/doc        : $%.4f", total_cost / max(success_count, 1))
-    logger.info("=" * 50)
+    logger.info("  Documentos procesados : %d", len(docs))
+    logger.info("  Exitosos              : %d", success_count)
+    logger.info("  Errores               : %d", error_count)
+    logger.info("  Tiempo total          : %.1fs", elapsed)
+    logger.info("  Costo estimado total  : $%.4f", total_cost)
+    logger.info("  Costo promedio/doc    : $%.4f", total_cost / max(success_count, 1))
+    logger.info("=" * 55)
 
-    # Decisión GO/OPTIMIZE/STOP basada en costo mensual proyectado
-    # Asumiendo ~250 docs/mes
-    monthly_projection = total_cost / max(len(docs), 1) * 250
+    # ── Decisión GO/OPTIMIZE/STOP (proyección a 250 docs/mes) ────────────────
+    avg_cost = total_cost / max(success_count, 1)
+    monthly_projection = avg_cost * 250
     if monthly_projection < 100:
-        logger.info("✅ GO — Proyección mensual: $%.2f (< $100)", monthly_projection)
+        logger.info("✅ GO — Proyección mensual (250 docs): $%.2f (< $100)", monthly_projection)
     elif monthly_projection < 200:
         logger.warning("⚠️  OPTIMIZE — Proyección mensual: $%.2f ($100–$200)", monthly_projection)
     else:
@@ -172,7 +172,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--reset-flags",
         action="store_true",
-        help="Re-procesar todos los docs (ignora graph_ingested)",
+        help="Re-procesar todos los docs (ignora el flag graph_ingested)",
     )
     args = parser.parse_args()
     asyncio.run(hydrate_graph(dry_run=args.dry_run, limit=args.limit, reset_flags=args.reset_flags))

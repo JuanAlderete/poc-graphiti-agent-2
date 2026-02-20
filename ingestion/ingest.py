@@ -30,7 +30,6 @@ _PARTICIPANTS_SECTION = re.compile(
     r"Participantes?:(.+?)(?:\n\n|\Z)", re.DOTALL | re.IGNORECASE
 )
 
-# Palabras comunes a filtrar del detector de empresas
 _COMMON_WORDS = {
     "Este", "Esta", "Pero", "Para", "Como", "Cuando", "Donde",
     "Tiene", "Todo", "Todos", "También", "Además", "Sobre", "Entre",
@@ -49,7 +48,8 @@ class DocumentIngestionPipeline:
         filename = os.path.basename(file_path)
         op_id = f"ingest_{filename}_{int(start_time)}"
         tracker.start_operation(op_id, "ingestion")
-        cost = 0.0
+        # FIXED: ya no se llama end_operation en el try block.
+        # Solo se llama en finally para garantizar cleanup.
 
         try:
             with open(file_path, encoding="utf-8") as fh:
@@ -59,7 +59,6 @@ class DocumentIngestionPipeline:
             content_hash = hashlib.sha256(raw_content.encode()).hexdigest()
             if await document_exists_by_hash(content_hash):
                 logger.info("Skipping %s — already ingested (hash match).", filename)
-                tracker.end_operation(op_id)
                 return 0.0
 
             # ── 2. Frontmatter ────────────────────────────────────────────
@@ -73,12 +72,10 @@ class DocumentIngestionPipeline:
                 "filename": filename,
                 "content_hash": content_hash,
                 **frontmatter,
-                # Entidades detectadas — usadas por hydrate_graph.py en Fase 2
                 "detected_people": extracted["people"],
                 "detected_companies": extracted["companies"],
                 "detected_quotes_count": len(extracted["quotes"]),
                 "detected_segments": extracted["segments"],
-                # Contexto pre-formateado para Graphiti (gratis calcular ahora)
                 "graphiti_ready_context": self._build_graphiti_context(
                     filename, frontmatter, extracted
                 ),
@@ -117,7 +114,6 @@ class DocumentIngestionPipeline:
 
             # ── 8. Graph ingestion (opcional) ─────────────────────────────
             if not skip_graphiti:
-                # Inyectamos el contexto pre-calculado para guiar a Graphiti
                 await GraphClient.add_episode(
                     content=content_body,
                     source_reference=filename,
@@ -125,6 +121,19 @@ class DocumentIngestionPipeline:
                 )
 
             latency = time.time() - start_time
+            logger.info(
+                "Ingested %s: chunks=%d people=%d companies=%d time=%.2fs",
+                filename, len(chunks),
+                len(extracted["people"]), len(extracted["companies"]),
+                latency,
+            )
+            return 0.0  # cost se calcula abajo en finally
+
+        except Exception:
+            logger.exception("Failed to ingest %s", file_path)
+            raise
+        finally:
+            # FIXED: end_operation SOLO aquí, una única vez
             metrics = tracker.end_operation(op_id)
             cost = metrics.cost_usd if metrics else 0.0
 
@@ -133,27 +142,16 @@ class DocumentIngestionPipeline:
                 "timestamp": start_time,
                 "source_type": "markdown",
                 "nombre_archivo": filename,
-                "longitud_palabras": len(content_body.split()),
-                "chunks_creados": len(chunks),
-                "embeddings_tokens": embed_tokens,
-                "entidades_detectadas": len(extracted["people"]) + len(extracted["companies"]),
+                "longitud_palabras": len(raw_content.split()) if 'raw_content' in dir() else 0,
+                "chunks_creados": len(chunks) if 'chunks' in dir() else 0,
+                "embeddings_tokens": metrics.tokens_in if metrics else 0,
+                "entidades_detectadas": (
+                    len(extracted.get("people", [])) + len(extracted.get("companies", []))
+                    if 'extracted' in dir() else 0
+                ),
                 "costo_total_usd": cost,
-                "tiempo_seg": latency,
+                "tiempo_seg": time.time() - start_time,
             })
-
-            logger.info(
-                "Ingested %s: chunks=%d people=%d companies=%d cost=$%.4f time=%.2fs",
-                filename, len(chunks),
-                len(extracted["people"]), len(extracted["companies"]),
-                cost, latency,
-            )
-            return cost
-
-        except Exception:
-            logger.exception("Failed to ingest %s", file_path)
-            raise
-        finally:
-            tracker.end_operation(op_id)
 
     # ─── Parsing ──────────────────────────────────────────────────────────────
 
@@ -180,21 +178,11 @@ class DocumentIngestionPipeline:
     # ─── Extracción heurística (sin LLM) ─────────────────────────────────────
 
     def _extract_entities_heuristic(self, text: str) -> dict:
-        """
-        Detecta entidades sin LLM usando regexes y patrones del formato Novotalks.
-
-        Por qué es valioso para Graphiti:
-        - Graphiti corre varios prompts de extracción por episodio. Si le decimos
-          explícitamente "las personas son X, Y, Z", el LLM no necesita inferirlo,
-          ahorrando un prompt de extracción completo.
-        - Reduce alucinaciones: sin contexto, Graphiti puede crear nodos con
-          nombres mal escritos o inventados.
-        """
-        # ── Personas ──────────────────────────────────────────────────────────
+        """Detecta entidades sin LLM usando regexes y patrones del formato Novotalks."""
+        # Personas
         people: list[str] = []
         pm = _PARTICIPANTS_SECTION.search(text)
         if pm:
-            # Bloque de participantes explícito — más preciso
             people = [m.group(1).strip() for m in _NAME_PATTERN.finditer(pm.group(1))]
         if not people:
             seen: set[str] = set()
@@ -205,7 +193,7 @@ class DocumentIngestionPipeline:
                     people.append(n)
             people = people[:15]
 
-        # ── Empresas / herramientas ────────────────────────────────────────────
+        # Empresas / herramientas
         freq: dict[str, int] = {}
         for m in _COMPANY_HINT_PATTERN.finditer(text):
             w = m.group(1)
@@ -213,10 +201,10 @@ class DocumentIngestionPipeline:
                 freq[w] = freq.get(w, 0) + 1
         companies = sorted([k for k, v in freq.items() if v >= 2], key=lambda x: -freq[x])[:20]
 
-        # ── Citas destacadas ───────────────────────────────────────────────────
+        # Citas
         quotes = _QUOTE_PATTERN.findall(text)[:10]
 
-        # ── Segmentos con timestamp ────────────────────────────────────────────
+        # Segmentos con timestamp
         segments: list[dict] = []
         for i, line in enumerate(text.splitlines()):
             ts_m = _TS_PATTERN.search(line)
@@ -234,15 +222,7 @@ class DocumentIngestionPipeline:
     def _build_graphiti_context(
         self, filename: str, frontmatter: dict, extracted: dict
     ) -> str:
-        """
-        Construye el string para `source_description` en add_episode().
-
-        Este campo es la pista más importante que le podemos dar a Graphiti:
-        - Le dice qué tipo de documento es (podcast, guía, etc.)
-        - Le lista las personas que DEBE reconocer como entidades
-        - Le lista los temas cubiertos
-        Calcularlo aquí (Fase 1, costo $0) ahorra tokens en Fase 2.
-        """
+        """Construye el string para source_description en add_episode()."""
         parts: list[str] = []
         title = frontmatter.get("title") or filename.replace(".md", "").replace("_", " ").title()
         parts.append(f"Document: {title}")
@@ -286,7 +266,9 @@ class DocumentIngestionPipeline:
 
         last = "\n".join(lines[prev:]).strip()
         if len(last) > 100:
-            result.extend(self.chunker.chunk(last) if len(last) > self.chunker.chunk_size * 2 else [last])
+            result.extend(
+                self.chunker.chunk(last) if len(last) > self.chunker.chunk_size * 2 else [last]
+            )
 
         return result if len(result) >= 2 else self.chunker.chunk(text)
 
@@ -303,6 +285,11 @@ async def ingest_directory(directory: str, skip_graphiti: bool = False) -> None:
     pipeline = DocumentIngestionPipeline()
     await DatabasePool.init_db()
 
+    # Asegurar que Graphiti está inicializado ANTES del bucle de ingesta
+    # (build_indices_and_constraints solo se llama una vez gracias al flag _initialized)
+    if not skip_graphiti:
+        await GraphClient.ensure_schema()
+
     files = sorted([
         os.path.join(directory, f)
         for f in os.listdir(directory)
@@ -318,15 +305,19 @@ async def ingest_directory(directory: str, skip_graphiti: bool = False) -> None:
 
     async def _bound(f: str) -> float:
         async with sem:
-            return await pipeline.ingest_file(f, skip_graphiti=skip_graphiti)
+            return await pipeline.ingest_file(f, skip_graphiti=skip_graphiti) or 0.0
 
     mode = "Postgres Only" if skip_graphiti else "Postgres + Graphiti"
     logger.info("Ingesting %d files [%s, concurrency=%d]…", len(files), mode, concurrency)
 
     results = await asyncio.gather(*(_bound(f) for f in files), return_exceptions=True)
     total = sum(r for r in results if isinstance(r, float))
+    errors = sum(1 for r in results if isinstance(r, Exception))
     elapsed = time.time() - t0
-    logger.info("Done: %d files in %.1fs — total cost $%.4f", len(files), elapsed, total)
+    logger.info(
+        "Done: %d files in %.1fs — total cost $%.4f — errors: %d",
+        len(files), elapsed, total, errors,
+    )
 
 
 if __name__ == "__main__":

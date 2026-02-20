@@ -1,54 +1,53 @@
-import asyncio
 import argparse
+import asyncio
 import logging
+import os
 import time
-from poc.check_system import check_connections
+
+from agent.graph_utils import GraphClient
+from agent.tools import graph_search_tool, hybrid_search_tool, vector_search_tool
 from ingestion.ingest import ingest_directory
-from agent.tools import vector_search_tool, graph_search_tool, hybrid_search_tool
-from poc.queries import TEST_QUERIES
+from poc.check_system import check_connections
 from poc.content_generator import get_content_generator
 from poc.prompts import email, historia, reel_cta, reel_lead_magnet
-from agent.graph_utils import GraphClient
+from poc.queries import TEST_QUERIES
 
+# Asegurar que el directorio de logs existe antes de configurar el FileHandler
+os.makedirs("logs", exist_ok=True)
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler("logs/poc_execution.log"),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
-async def run_ingestion(directory: str, skip_graphiti: bool = False):
-    logger.info(f"Starting ingestion from {directory} (Skip Graphiti: {skip_graphiti})...")
-    
-    if not skip_graphiti:
-        logger.info("Ensuring Graphiti schema indices...")
-        await GraphClient.ensure_schema()
-        
-    await ingest_directory(directory, skip_graphiti=skip_graphiti)
 
+async def run_ingestion(directory: str, skip_graphiti: bool = False) -> None:
+    logger.info("Starting ingestion from '%s' (skip_graphiti=%s)…", directory, skip_graphiti)
+    # FIXED: no llamamos ensure_schema() aquí — ingest_directory() ya lo hace
+    # internamente cuando skip_graphiti=False. ensure_initialized() es idempotente
+    # pero quitamos la llamada redundante para mayor claridad.
+    await ingest_directory(directory, skip_graphiti=skip_graphiti)
     logger.info("Ingestion complete.")
 
 
-async def run_search_tests(skip_graphiti: bool = False):
-    logger.info(f"Starting search tests (skip_graphiti={skip_graphiti})...")
-    
+async def run_search_tests(skip_graphiti: bool = False) -> None:
+    logger.info("Starting search tests (skip_graphiti=%s)…", skip_graphiti)
+
     for q in TEST_QUERIES:
         q_text = q["text"]
         q_type = q["type"]
         q_id = q["id"]
-        
-        # Skip reasoning
-        if skip_graphiti and (q_type == "graph" or q_type == "hybrid"):
-            # logger.info(f"Skipping Query {q_id} ({q_type}) due to skip_graphiti")
+
+        if skip_graphiti and q_type in ("graph", "hybrid"):
             continue
 
         try:
-            logger.info(f"Running Query {q_id} ({q_type}): {q_text}")
+            logger.info("Query %s (%s): %s", q_id, q_type, q_text)
             if q_type == "vector":
                 await vector_search_tool(q_text)
             elif q_type == "graph":
@@ -56,100 +55,107 @@ async def run_search_tests(skip_graphiti: bool = False):
             elif q_type == "hybrid":
                 await hybrid_search_tool(q_text)
             else:
-                logger.warning(f"Unknown query type: {q_type}")
+                logger.warning("Unknown query type: %s", q_type)
         except Exception as e:
-            logger.error(f"Error in query {q_id}: {e}")
+            logger.error("Error in query %s: %s", q_id, e)
 
     logger.info("Search tests complete.")
 
 
-async def run_generation_tests():
-    logger.info("Starting generation tests...")
+async def run_generation_tests() -> None:
+    logger.info("Starting generation tests…")
     generator = get_content_generator()
-    
-    # 1. Email
-    logger.info("Generating Email...")
-    email_prompt = email.PROMPT_TEMPLATE.format(
-        topic="SaaS Growth",
-        context="Contexto simulado sobre crecimiento B2B...",
-        objective="Agendar una demo"
-    )
-    email_content = await generator.generate(email_prompt, email.SYSTEM_PROMPT)
-    print(f"\n--- EMAIL CONTENT ---\n{email_content}\n---------------------\n")
-    
-    # 2. Historia
-    logger.info("Generating Historia...")
-    historia_prompt = historia.PROMPT_TEMPLATE.format(
-        topic="El origen de una startup",
-        context="Fundadores en un garaje...",
-        tone="Inspirador"
-    )
-    historia_content = await generator.generate(historia_prompt, historia.SYSTEM_PROMPT)
-    print(f"\n--- STORITELLING CONTENT ---\n{historia_content}\n----------------------------\n")
-    
-    # 3. Reel CTA
-    logger.info("Generating Reel CTA...")
-    cta_prompt = reel_cta.PROMPT_TEMPLATE.format(
-        topic="Productivity Hacks",
-        context="Uso de herramientas AI...",
-        cta="Sígueme para más"
-    )
-    cta_content = await generator.generate(cta_prompt, reel_cta.SYSTEM_PROMPT)
-    print(f"\n--- REEL CTA CONTENT ---\n{cta_content}\n------------------------\n")
+
+    tests = [
+        (
+            "Email",
+            email.PROMPT_TEMPLATE.format(
+                topic="SaaS Growth",
+                context="Contexto simulado sobre crecimiento B2B...",
+                objective="Agendar una demo",
+            ),
+            email.SYSTEM_PROMPT,
+        ),
+        (
+            "Historia",
+            historia.PROMPT_TEMPLATE.format(
+                topic="El origen de una startup",
+                context="Fundadores en un garaje...",
+                tone="Inspirador",
+            ),
+            historia.SYSTEM_PROMPT,
+        ),
+        (
+            "Reel CTA",
+            reel_cta.PROMPT_TEMPLATE.format(
+                topic="Productivity Hacks",
+                context="Uso de herramientas AI...",
+                cta="Sígueme para más",
+            ),
+            reel_cta.SYSTEM_PROMPT,
+        ),
+    ]
+
+    for name, prompt, system in tests:
+        logger.info("Generating %s…", name)
+        try:
+            content = await generator.generate(prompt, system)
+            separator = "-" * 40
+            print(f"\n{separator}\n{name.upper()}\n{separator}\n{content}\n")
+        except Exception as e:
+            logger.error("Generation failed for %s: %s", name, e)
 
     logger.info("Generation tests complete.")
 
 
-async def main():
+async def main() -> None:
     parser = argparse.ArgumentParser(description="Run Graphiti POC")
-    parser.add_argument("--skip-checks", action="store_true", help="Skip system health checks")
+    parser.add_argument("--skip-checks", action="store_true", help="Skip health checks")
     parser.add_argument("--ingest", type=str, help="Directory to ingest docs from")
     parser.add_argument("--search", action="store_true", help="Run search tests")
     parser.add_argument("--generate", action="store_true", help="Run generation tests")
     parser.add_argument("--all", action="store_true", help="Run all phases")
-    parser.add_argument("--skip-graphiti", action="store_true", help="Skip Graphiti ingestion (Postgres only)")
-    parser.add_argument("--clear-logs", action="store_true", help="Clear all CSV logs before running")
-    parser.add_argument("--clear-db", action="store_true", help="Clear Postgres database (documents & chunks) before running")
-    
+    parser.add_argument("--skip-graphiti", action="store_true", help="Skip Graphiti (Postgres only)")
+    parser.add_argument("--clear-logs", action="store_true", help="Clear CSV logs before running")
+    parser.add_argument("--clear-db", action="store_true", help="Clear Postgres DB before running")
+
     args = parser.parse_args()
-    
+
+    # ── Health check ──────────────────────────────────────────────────────────
     if not args.skip_checks:
         if not await check_connections():
             logger.error("System checks failed. Exiting.")
             return
 
+    # ── Limpieza opcional ─────────────────────────────────────────────────────
     if args.clear_logs:
         from poc.logging_utils import clear_all_logs
-        logger.info("Clearing all CSV logs...")
+        logger.info("Clearing all CSV logs…")
         clear_all_logs()
-        # Also clear the execution log if possible, though we are writing to it right now.
-        # We'll just leave poc_execution.log as it captures this run's info.
 
     if args.clear_db:
         from agent.db_utils import DatabasePool
-        logger.info("Clearing Postgres database (documents, chunks)...")
+        logger.info("Clearing Postgres database…")
         await DatabasePool.clear_database()
+        # También resetear el cliente Graphiti para que reinicialice los índices
+        GraphClient.reset()
 
+    # ── Ingesta ───────────────────────────────────────────────────────────────
+    # FIXED: la lógica anterior tenía un elif anidado que nunca se ejecutaba
+    ingest_dir = args.ingest
+    if (args.ingest or args.all) and ingest_dir:
+        await run_ingestion(ingest_dir, skip_graphiti=args.skip_graphiti)
+    elif args.all and not ingest_dir:
+        logger.info("--all activado sin --ingest: saltando ingesta (no hay directorio).")
 
-
-    if args.ingest or args.all:
-        if args.ingest:
-            await run_ingestion(args.ingest, skip_graphiti=args.skip_graphiti)
-
-        elif args.all:
-            # Default doc path if --all used without --ingest?
-            # Or assume user passes --ingest with --all if they want ingestion
-            if args.ingest:
-                 await run_ingestion(args.ingest)
-            else:
-                logger.info("Skipping ingestion (no directory provided).")
-
+    # ── Búsquedas ─────────────────────────────────────────────────────────────
     if args.search or args.all:
         await run_search_tests(skip_graphiti=args.skip_graphiti)
 
-
+    # ── Generación ────────────────────────────────────────────────────────────
     if args.generate or args.all:
         await run_generation_tests()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
