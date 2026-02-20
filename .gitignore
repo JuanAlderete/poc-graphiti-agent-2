@@ -196,3 +196,13 @@ secrets/
 *.key
 *.pem
 *.crt
+
+# Graphiti
+.graphiti
+
+# Others
+*.csv
+*.json
+*.yml
+*.yaml
+repomix-output.xml

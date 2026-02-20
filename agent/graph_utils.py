@@ -1,155 +1,141 @@
 import logging
-import time
+import uuid
 from datetime import datetime
-from typing import List, Dict, Any
-# Updated import based on inspection
+from typing import List
+
 from graphiti_core import Graphiti
-# from graphiti_core.nodes import Episode
 
 from agent.config import settings
 from poc.token_tracker import tracker
 
 logger = logging.getLogger(__name__)
 
+# Fraction of input tokens used as output estimate for Graphiti extraction.
+# Graphiti runs entity/relation extraction LLM calls whose outputs are much
+# shorter than the input episode.  0.30 is a reasonable conservative estimate.
+_GRAPHITI_OUTPUT_RATIO = 0.30
+
+
 class GraphClient:
     _client = None
 
     @classmethod
-    def get_client(cls):
-        if cls._client is None:
-            try:
-                # Determine provider
-                provider = settings.LLM_PROVIDER.lower()
-                
-                if provider == "gemini":
-                    from agent.gemini_client import GeminiClient
-                    from graphiti_core.embedder.gemini import GeminiEmbedder
-                     
-                    logger.info("Initializing Graphiti with Gemini...")
-                    
-                    llm_client = GeminiClient(model_name=settings.DEFAULT_MODEL) # e.g. gemini-1.5-flash
-                    # Embedder needs config? 
-                    # Inspect showed: GeminiEmbedder(config: GeminiEmbedderConfig | None = None)
-                    # We can pass None to use default or create config if needed. 
-                    # Default likely uses env var or we need to pass api key in config?
-                    # The GeminiEmbedder likely uses google.generativeai.configure which we did in GeminiClient
-                    embedder = GeminiEmbedder() 
-                    
-                    cls._client = Graphiti(
-                        uri=settings.NEO4J_URI,
-                        user=settings.NEO4J_USER,
-                        password=settings.NEO4J_PASSWORD,
-                        llm_client=llm_client,
-                        embedder=embedder
-                    )
-                else:
-                    # Default (OpenAI)
-                    cls._client = Graphiti(
-                        uri=settings.NEO4J_URI,
-                        user=settings.NEO4J_USER,
-                        password=settings.NEO4J_PASSWORD
-                    )
-                    
-                logger.info(f"Graphiti client initialized ({provider}).")
-            except Exception as e:
-                logger.error(f"Failed to initialize Graphiti client: {e}")
-                raise
+    def get_client(cls) -> Graphiti:
+        """
+        Returns (or lazily creates) the Graphiti singleton.
+        NOTE: must be called before or outside the async event loop if the
+        Neo4j driver performs synchronous init.  In practice this is fine
+        because it is called at the start of run_poc.py's `ensure_schema`.
+        """
+        if cls._client is not None:
+            return cls._client
+
+        provider = settings.LLM_PROVIDER.lower()
+        try:
+            if provider == "gemini":
+                from agent.gemini_client import GeminiClient
+                from graphiti_core.embedder.gemini import GeminiEmbedder
+
+                logger.info("Initializing Graphiti with Gemini…")
+                llm_client = GeminiClient(model_name=settings.DEFAULT_MODEL)
+                embedder = GeminiEmbedder()
+                cls._client = Graphiti(
+                    uri=settings.NEO4J_URI,
+                    user=settings.NEO4J_USER,
+                    password=settings.NEO4J_PASSWORD,
+                    llm_client=llm_client,
+                    embedder=embedder,
+                )
+            else:
+                from graphiti_core.llm_client.config import LLMConfig
+                from graphiti_core.llm_client.openai_client import OpenAIClient
+
+                logger.info("Initializing Graphiti with OpenAI (%s)…", settings.DEFAULT_MODEL)
+                llm_config = LLMConfig(
+                    api_key=settings.OPENAI_API_KEY,
+                    model=settings.DEFAULT_MODEL,
+                )
+                llm_client = OpenAIClient(config=llm_config)
+                cls._client = Graphiti(
+                    uri=settings.NEO4J_URI,
+                    user=settings.NEO4J_USER,
+                    password=settings.NEO4J_PASSWORD,
+                    llm_client=llm_client,
+                )
+
+            logger.info("Graphiti client initialized (provider=%s).", provider)
+        except Exception:
+            logger.exception("Failed to initialize Graphiti client")
+            raise
+
         return cls._client
 
     @classmethod
-    async def ensure_schema(cls):
-        """
-        Ensures that necessary Neo4j indices exist.
-        """
+    async def ensure_schema(cls) -> None:
+        """Creates necessary Neo4j indices / constraints if they don't exist."""
         client = cls.get_client()
         try:
-            # Create fulltext index required by graphiti_core
-            # We use the driver directly. 
-            # graphiti_core driver wrapper has execute_query
-            
-            # Check/Create node_name_and_summary
-            # Note: The label 'Entity' and properties 'name', 'summary' are assumed based on graphiti defaults.
-            # If graphiti uses different labels, we might need to adjust. 
-            # But the error 'node_name_and_summary' matches standard graphiti.
-            
-            query = """
-            CREATE FULLTEXT INDEX node_name_and_summary IF NOT EXISTS
-            FOR (n:Entity)
-            ON EACH [n.name, n.summary]
-            """
-            
-            # Using client.driver.execute_query which is async
-            await client.driver.execute_query(query)
-            
-            # Also ensure constraints if needed, usually on uuid
-            query_constraint = """
-            CREATE CONSTRAINT entity_uuid IF NOT EXISTS
-            FOR (n:Entity) REQUIRE n.uuid IS UNIQUE
-            """
-            await client.driver.execute_query(query_constraint)
-
+            await client.driver.execute_query(
+                """
+                CREATE FULLTEXT INDEX node_name_and_summary IF NOT EXISTS
+                FOR (n:Entity)
+                ON EACH [n.name, n.summary]
+                """
+            )
+            await client.driver.execute_query(
+                """
+                CREATE CONSTRAINT entity_uuid IF NOT EXISTS
+                FOR (n:Entity) REQUIRE n.uuid IS UNIQUE
+                """
+            )
             logger.info("Graphiti Neo4j schema/indices ensured.")
-        except Exception as e:
-            logger.error(f"Failed to ensure Graphiti schema: {e}")
-            # We continue, as it might already exist or we might have permissions issues, 
-            # but let's hope it works.
-
-
+        except Exception:
+            logger.exception("Failed to ensure Graphiti schema — continuing anyway")
 
     @classmethod
-    async def add_episode(cls, content: str, source_reference: str):
-        """
-        Adds an episode to the graph.
-        """
+    async def add_episode(cls, content: str, source_reference: str) -> None:
+        """Adds an episode to the knowledge graph and tracks estimated cost."""
         client = cls.get_client()
-        
-        # Estimate tokens
-        estimated_input_tokens = tracker.estimate_tokens(content)
-        op_id = f"graph_ingest_{int(time.time()*1000)}"
+
+        estimated_input = tracker.estimate_tokens(content)
+        # FIXED: use a UUID-based op_id to avoid collision under concurrency
+        op_id = f"graph_ingest_{uuid.uuid4().hex}"
         tracker.start_operation(op_id, "graph_ingestion")
-        
+
         try:
-            # Import EpisodeType locally to avoid circular imports if any, or just compatibility
             from graphiti_core.nodes import EpisodeType
 
-            # Updated add_episode query based on inspection
             await client.add_episode(
                 name=source_reference,
                 episode_body=content,
                 source_description=f"Ingestion from {source_reference}",
                 reference_time=datetime.now(),
-                source=EpisodeType.text
+                source=EpisodeType.text,
             )
-            
-            # Mocking output tokens
-            estimated_output_tokens = estimated_input_tokens // 2 
-            
+
+            # FIXED: more realistic output estimate (was // 2 = 50 %, now 30 %)
+            estimated_output = int(estimated_input * _GRAPHITI_OUTPUT_RATIO)
             tracker.record_usage(
-                op_id, 
-                estimated_input_tokens, 
-                estimated_output_tokens, 
+                op_id,
+                estimated_input,
+                estimated_output,
                 settings.DEFAULT_MODEL,
-                "graphiti_add_episode"
+                "graphiti_add_episode",
             )
-            
-        except Exception as e:
-            logger.error(f"Error adding episode to graph: {e}")
+
+        except Exception:
+            logger.exception("Error adding episode to graph (%s)", source_reference)
             raise
         finally:
             metrics = tracker.end_operation(op_id)
             if metrics:
-                logger.info(f"Graph ingestion cost: ${metrics.cost_usd:.4f}")
+                logger.info(
+                    "Graph ingestion %s: est. cost $%.4f", source_reference, metrics.cost_usd
+                )
 
     @classmethod
     async def search(cls, query: str) -> List[str]:
-        """
-        Searches the graph for relevant info.
-        """
+        """Searches the knowledge graph and returns result strings."""
         client = cls.get_client()
-        # Use search method
         results = await client.search(query)
-        
-        # Transform results to string list. Assuming results are edges or can be stringified.
-        # Ideally we'd extract meaningful text. For now, string representation.
         return [str(r) for r in results] if results else []
-

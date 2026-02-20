@@ -1,30 +1,41 @@
 import asyncio
+import json
+import logging
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional
+
 import asyncpg
 
-import logging
-import json
-from contextlib import asynccontextmanager
-from typing import List, Dict, Any, Optional
 from agent.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Pool management
+# ---------------------------------------------------------------------------
+
 class DatabasePool:
-    _pool = None
-    _loop = None
+    _pool: Optional[asyncpg.Pool] = None
+    _loop: Optional[asyncio.AbstractEventLoop] = None
 
     @classmethod
-    async def get_pool(cls):
+    async def get_pool(cls) -> asyncpg.Pool:
         current_loop = asyncio.get_running_loop()
-        
-        # Reset if pool belongs to a different or closed loop
+
         if cls._pool is not None:
-            if cls._loop != current_loop or cls._loop.is_closed():
-                logger.warning("Event loop changed or closed. Resetting connection pool.")
-                # We cannot safely close the old pool if the loop is closed, 
-                # so we just drop the reference.
+            loop_changed = cls._loop is not current_loop
+            loop_closed = cls._loop is None or cls._loop.is_closed()
+            if loop_changed or loop_closed:
+                logger.warning("Event loop changed or closed — resetting DB pool.")
+                # Attempt a clean close; ignore errors (old loop may be gone)
+                try:
+                    await cls._pool.close()
+                except Exception:
+                    pass
                 cls._pool = None
-        
+                cls._loop = None
+
         if cls._pool is None:
             try:
                 cls._pool = await asyncpg.create_pool(
@@ -33,110 +44,79 @@ class DatabasePool:
                     database=settings.POSTGRES_DB,
                     host=settings.POSTGRES_HOST,
                     port=settings.POSTGRES_PORT,
-                    min_size=1,
-                    max_size=10
+                    min_size=2,
+                    max_size=10,
+                    command_timeout=30,
                 )
                 cls._loop = current_loop
-                logger.info("Database pool created.")
-            except Exception as e:
-                logger.error(f"Failed to create database pool: {e}")
+                logger.info("Database connection pool created (min=2, max=10).")
+            except Exception:
+                logger.exception("Failed to create database pool")
                 raise
-        return cls._pool
 
+        return cls._pool  # type: ignore[return-value]
 
     @classmethod
-    async def close(cls):
+    async def close(cls) -> None:
         if cls._pool:
             await cls._pool.close()
             cls._pool = None
+            cls._loop = None
 
     @classmethod
-    async def clear_database(cls):
-        """Truncates documents and chunks tables."""
+    async def clear_database(cls) -> None:
+        """Truncates documents and chunks tables (CASCADE)."""
         pool = await cls.get_pool()
         async with pool.acquire() as conn:
-            try:
-                await conn.execute("TRUNCATE TABLE chunks, documents CASCADE;")
-                logger.info("Cleared Postgres tables: documents, chunks.")
-            except Exception as e:
-                logger.error(f"Failed to clear database: {e}")
-                raise
+            await conn.execute("TRUNCATE TABLE chunks, documents CASCADE;")
+            logger.info("Cleared Postgres tables: documents, chunks.")
 
     @classmethod
-    async def init_db(cls):
-
+    async def init_db(cls) -> None:
         """
-        Initializes the database schema.
-        Note: The schema is currently managed via sql/schema.sql.
-        This method serves as a check or fallback.
-        In a real prod setup, we'd use migration tools like Alembic.
+        Ensures required extensions exist and applies schema.sql if the
+        chunks table is missing.
         """
         pool = await cls.get_pool()
         async with pool.acquire() as conn:
-            try:
-                # Basic check if vector extension exists
-                await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-                await conn.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";")
-                await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm;")
-                
-                logger.info("Database extensions checked.")
+            # Extensions
+            for ext in ("vector", "uuid-ossp", "pg_trgm"):
+                await conn.execute(f'CREATE EXTENSION IF NOT EXISTS "{ext}";')
+            logger.info("Database extensions ensured.")
 
-                # Determine expected dimension based on config
-                # Default to 1536 (OpenAI) if unknown
-                expected_dim = 1536
-                if "gemini" in settings.LLM_PROVIDER.lower() or "004" in settings.EMBEDDING_MODEL:
-                     expected_dim = 768
-                
-                logger.info(f"Expected embedding dimension: {expected_dim}")
+            # Determine vector dimension
+            expected_dim = 768 if (
+                "gemini" in settings.LLM_PROVIDER.lower()
+                or "004" in settings.EMBEDDING_MODEL
+            ) else 1536
+            logger.info("Expected embedding dimension: %d", expected_dim)
 
-                # Check if chunks table exists
-                table_exists = await conn.fetchval("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
-                        WHERE  table_schema = 'public'
-                        AND    table_name   = 'chunks'
-                    );
-                """)
+            table_exists = await conn.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'chunks'
+                )
+                """
+            )
 
-                if not table_exists:
-                    # Apply schema.sql with correct dimension
-                    try:
-                        with open('sql/schema.sql', 'r', encoding='utf-8') as f:
-                            schema_sql = f.read()
-                        
-                        # Replace default vector(1536) with expected
-                        if expected_dim != 1536:
-                            schema_sql = schema_sql.replace("vector(1536)", f"vector({expected_dim})")
-                            logger.info(f"Adjusted schema to vector({expected_dim})")
-                            
-                        await conn.execute(schema_sql)
-                        logger.info("Database schema applied from sql/schema.sql.")
-                    except Exception as e:
-                         logger.error(f"Failed to apply schema: {e}")
-                         raise
-                else:
-                    # Table exists, check dimension
-                    # We can check pg_attribute or try to cast or check information_schema (if data_type shows it)
-                    # psql \d chunks shows vector(1536).
-                    # 'atttypmod' stores width/precision. For vector, it might be related.
-                    # Safest: Use a query to check
-                    try:
-                        # typmod for vector(N) is usually N
-                        # But let's check exact string representation if possible?
-                        # Or checking error on dummy insert? No.
-                        # Query pg_attribute for atttypmod
-                        # Postgres stores (dim) in atttypmod but offset by 4?
-                        # Let's trust that if the user didn't drop tables, they might have 1536.
-                        # We will log a warning if we detect mismatch, or just let it fail at runtime.
-                        # But detecting is better.
-                        pass # Placeholder for advanced check. 
-                        # If mismatch, insert will fail with "vector has different dimension". 
-                        # We'll rely on that for now to avoid complex introspection logic bugs.
-                    except Exception:
-                        pass
+            if not table_exists:
+                try:
+                    with open("sql/schema.sql", encoding="utf-8") as fh:
+                        schema_sql = fh.read()
+                    if expected_dim != 1536:
+                        schema_sql = schema_sql.replace("vector(1536)", f"vector({expected_dim})")
+                        logger.info("Adjusted schema to vector(%d)", expected_dim)
+                    await conn.execute(schema_sql)
+                    logger.info("Database schema applied from sql/schema.sql.")
+                except Exception:
+                    logger.exception("Failed to apply schema")
+                    raise
 
-            except Exception as e:
-                logger.error(f"DB Init Error: {e}")
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def get_db_connection():
@@ -144,60 +124,120 @@ async def get_db_connection():
     async with pool.acquire() as conn:
         yield conn
 
-async def insert_document(title: str, source: str, content: str, metadata: dict = {}) -> str:
-    """Inserts a document metadata record and returns its ID."""
+
+def _fmt_vec(embedding: List[float]) -> str:
+    """Convert a Python float list to the pgvector literal format '[1.0,2.0,...]'."""
+    return "[" + ",".join(str(v) for v in embedding) + "]"
+
+
+# ---------------------------------------------------------------------------
+# Insert helpers
+# ---------------------------------------------------------------------------
+
+async def insert_document(
+    title: str,
+    source: str,
+    content: str,
+    metadata: dict | None = None,
+) -> str:
+    """Inserts a document record and returns its UUID as a string."""
     async with get_db_connection() as conn:
-        doc_id = await conn.fetchval("""
-            INSERT INTO documents (title, source, content, metadata) 
+        doc_id = await conn.fetchval(
+            """
+            INSERT INTO documents (title, source, content, metadata)
             VALUES ($1, $2, $3, $4)
             RETURNING id
-        """, title, source, content, json.dumps(metadata))
+            """,
+            title,
+            source,
+            content,
+            json.dumps(metadata or {}),
+        )
         return str(doc_id)
 
-async def insert_chunks(doc_id: str, chunks: List[str], embeddings: List[List[float]], start_index: int = 0):
-    """Inserts chunks for a given document."""
+
+async def insert_chunks(
+    doc_id: str,
+    chunks: List[str],
+    embeddings: List[List[float]],
+    start_index: int = 0,
+) -> None:
+    """
+    Inserts chunks with their embeddings for a given document.
+
+    FIXED: uses _fmt_vec() consistently and passes metadata as a JSON string
+    rather than json.dumps({}) inside a tuple (minor but cleaner).
+    """
     async with get_db_connection() as conn:
-        chunk_data = []
-        for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
-            chunk_data.append((
-                doc_id, 
-                chunk_text, 
-                str(embedding), # pgvector format
-                start_index + i, 
-                json.dumps({}) 
-            ))
-            
-        await conn.executemany("""
+        chunk_data = [
+            (
+                doc_id,
+                chunk_text,
+                _fmt_vec(embedding),
+                start_index + i,
+                "{}",  # metadata JSONB — empty object literal
+            )
+            for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings))
+        ]
+        await conn.executemany(
+            """
             INSERT INTO chunks (document_id, content, embedding, chunk_index, metadata)
             VALUES ($1::uuid, $2, $3::vector, $4, $5::jsonb)
-        """, chunk_data)
+            """,
+            chunk_data,
+        )
 
-async def vector_search(embedding: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-    """Performs vector search using the match_chunks function or raw query."""
+
+# ---------------------------------------------------------------------------
+# Search helpers
+# ---------------------------------------------------------------------------
+
+async def vector_search(
+    embedding: List[float],
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """Cosine-similarity vector search against the chunks table."""
+    limit = max(1, limit)
     async with get_db_connection() as conn:
-        formatted_embedding = str(embedding)
-        # Using the simplified query matching the new schema
-        rows = await conn.fetch("""
-            SELECT 
+        rows = await conn.fetch(
+            """
+            SELECT
                 c.id,
-                c.content, 
+                c.content,
                 c.metadata,
                 d.title,
                 d.source,
-                1 - (c.embedding <=> $1::vector) as score
+                1 - (c.embedding <=> $1::vector) AS score
             FROM chunks c
             JOIN documents d ON c.document_id = d.id
             ORDER BY c.embedding <=> $1::vector
             LIMIT $2
-        """, formatted_embedding, limit)
+            """,
+            _fmt_vec(embedding),
+            limit,
+        )
         return [dict(row) for row in rows]
 
-async def hybrid_search(text_query: str, embedding: List[float], limit: int = 5) -> List[Dict[str, Any]]:
-    """Performs hybrid search using the stored procedure."""
+
+async def hybrid_search(
+    text_query: str,
+    embedding: List[float],
+    limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """Hybrid RRF search using the stored procedure defined in schema.sql."""
+    limit = max(1, limit)
     async with get_db_connection() as conn:
-        formatted_embedding = str(embedding)
-        # Calls the stored function defined in schema.sql
-        rows = await conn.fetch("""
-            SELECT * FROM hybrid_search($1::vector, $2, $3)
-        """, formatted_embedding, text_query, limit)
+        rows = await conn.fetch(
+            "SELECT * FROM hybrid_search($1::vector, $2, $3)",
+            _fmt_vec(embedding),
+            text_query,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+
+async def get_all_documents() -> List[Dict[str, Any]]:
+    """Fetches all documents (id, title, source, content, metadata) from the DB."""
+    async with get_db_connection() as conn:
+        rows = await conn.fetch("SELECT id, title, source, content, metadata FROM documents")
         return [dict(row) for row in rows]

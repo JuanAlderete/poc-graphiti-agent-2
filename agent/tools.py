@@ -1,164 +1,148 @@
-from agent.db_utils import vector_search, hybrid_search
+import json
+import logging
+import time
+from typing import Any, Dict, List
+
+from agent.config import settings
+from agent.db_utils import hybrid_search, vector_search
 from agent.graph_utils import GraphClient
 from agent.models import SearchResult
-from poc.token_tracker import tracker
+from ingestion.embedder import get_embedder
 from poc.logging_utils import search_logger
-from agent.config import settings
-import time
-import logging
-import json
-from typing import List, Dict, Any
-
+from poc.token_tracker import tracker
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parse_metadata(raw: Any) -> Dict[str, Any]:
+    """Normalise metadata coming from the DB (may be str-encoded JSON or dict)."""
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+    return raw or {}
+
+
+def _log_search(
+    op_id: str,
+    start_time: float,
+    query: str,
+    search_type: str,
+    embed_tokens: int,
+    llm_in: int,
+    llm_out: int,
+    embed_cost: float,
+    llm_cost: float,
+    result_count: int,
+    latency_ms: float,
+) -> None:
+    search_logger.log_row(
+        {
+            "query_id": op_id,
+            "timestamp": start_time,
+            "query_texto": query,
+            "longitud_query": len(query),
+            "tipo_busqueda": search_type,
+            "tokens_embedding": embed_tokens,
+            "tokens_llm_in": llm_in,
+            "tokens_llm_out": llm_out,
+            "costo_embedding_usd": embed_cost,
+            "costo_llm_usd": llm_cost,
+            "costo_total_usd": embed_cost + llm_cost,
+            "resultados_retornados": result_count,
+            "latencia_ms": latency_ms,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool implementations
+# ---------------------------------------------------------------------------
+
 async def vector_search_tool(query: str, limit: int = 5) -> List[SearchResult]:
-    """
-    Performs a vector search and logs metrics.
-    """
+    """Vector similarity search against Postgres chunks."""
     start_time = time.time()
-    op_id = f"search_vector_{int(start_time*1000)}"
+    op_id = f"search_vector_{start_time:.3f}"
     tracker.start_operation(op_id, "vector_search")
-    
-    # Estimate input tokens
-    tokens_in = tracker.estimate_tokens(query)
-    
-    # Mock embedding generation cost/tokens (since it happens inside db_utils or we should call embedder)
-    # Ideally, we call embedder here to get embedding, then pass to db_utils.
-    # We will assume db_utils handles it or we should refactor.
-    # For this POC, let's assume we use the embedder from ingestion (circular dependency risk, but okay for POC)
-    from ingestion.embedder import EmbeddingGenerator
-    embedder = EmbeddingGenerator()
+
+    embedder = get_embedder()  # FIXED: singleton, not new instance per call
     embedding, embed_tokens = await embedder.generate_embedding(query)
-    
-    tracker.record_usage(op_id, tokens_in, 0, settings.EMBEDDING_MODEL, "embedding_generation")
-    
+    tracker.record_usage(op_id, embed_tokens, 0, settings.EMBEDDING_MODEL, "embedding")
+
     results = await vector_search(embedding, limit)
-    
+
     latency_ms = (time.time() - start_time) * 1000
-    
-    # Log to CSV
-    # Calculate total costs
     metrics = tracker.end_operation(op_id)
     cost = metrics.cost_usd if metrics else 0.0
-    
-    search_logger.log_row({
-        "query_id": op_id,
-        "timestamp": start_time,
-        "query_texto": query,
-        "longitud_query": len(query),
-        "tipo_busqueda": "vector",
-        "tokens_embedding": embed_tokens,
-        "tokens_llm_in": 0,
-        "tokens_llm_out": 0,
-        "costo_embedding_usd": cost, # Simplified
-        "costo_llm_usd": 0,
-        "costo_total_usd": cost,
-        "resultados_retornados": len(results),
-        "latencia_ms": latency_ms
-    })
-    
+
+    _log_search(op_id, start_time, query, "vector", embed_tokens, 0, 0, cost, 0.0, len(results), latency_ms)
+
     return [
         SearchResult(
-            content=r['content'], 
-            metadata=json.loads(r['metadata']) if isinstance(r['metadata'], str) else r['metadata'], 
-            score=r['score'], 
-            source="postgres"
-        ) for r in results
+            content=r["content"],
+            metadata=_parse_metadata(r["metadata"]),
+            score=r["score"],
+            source="postgres",
+        )
+        for r in results
     ]
 
 
 async def graph_search_tool(query: str) -> List[SearchResult]:
-    """
-    Performs a graph search and logs metrics.
-    """
+    """Graph search via Graphiti / Neo4j."""
     start_time = time.time()
-    op_id = f"search_graph_{int(start_time*1000)}"
+    op_id = f"search_graph_{start_time:.3f}"
     tracker.start_operation(op_id, "graph_search")
-    
+
     tokens_in = tracker.estimate_tokens(query)
-    
-    # Graph search via Graphiti
+
     results_text = await GraphClient.search(query)
-    
-    # Estimate output tokens
+
     tokens_out = sum(tracker.estimate_tokens(t) for t in results_text)
-    
-    # Record LLM usage in graph search (if Graphiti uses LLM for search, which it does)
-    # We assume 'gpt-4o-mini' for graph search internal reasoning
     tracker.record_usage(op_id, tokens_in, tokens_out, settings.DEFAULT_MODEL, "graph_search_llm")
-    
+
     latency_ms = (time.time() - start_time) * 1000
-    
     metrics = tracker.end_operation(op_id)
     cost = metrics.cost_usd if metrics else 0.0
-    
-    search_logger.log_row({
-        "query_id": op_id,
-        "timestamp": start_time,
-        "query_texto": query,
-        "longitud_query": len(query),
-        "tipo_busqueda": "graph",
-        "tokens_embedding": 0,
-        "tokens_llm_in": tokens_in,
-        "tokens_llm_out": tokens_out,
-        "costo_embedding_usd": 0,
-        "costo_llm_usd": cost,
-        "costo_total_usd": cost,
-        "resultados_retornados": len(results_text),
-        "latencia_ms": latency_ms
-    })
-    
+
+    _log_search(op_id, start_time, query, "graph", 0, tokens_in, tokens_out, 0.0, cost, len(results_text), latency_ms)
+
     return [SearchResult(content=t, source="graphiti") for t in results_text]
 
+
 async def hybrid_search_tool(query: str, limit: int = 5) -> List[SearchResult]:
-    """
-    Combines vector and text search using Postgres RRF function.
-    """
+    """Hybrid RRF search: vector + full-text via Postgres stored procedure."""
     start_time = time.time()
-    op_id = f"search_hybrid_{int(start_time*1000)}"
+    op_id = f"search_hybrid_{start_time:.3f}"
     tracker.start_operation(op_id, "hybrid_search")
-    
-    # Estimate input tokens
-    tokens_in = tracker.estimate_tokens(query)
-    
-    # 1. Get Embedding (needed for vector part of hybrid)
-    from ingestion.embedder import EmbeddingGenerator
-    embedder = EmbeddingGenerator()
+
+    embedder = get_embedder()  # FIXED: singleton
     embedding, embed_tokens = await embedder.generate_embedding(query)
-    
-    tracker.record_usage(op_id, tokens_in, 0, settings.EMBEDDING_MODEL, "embedding_generation")
-    
-    # 2. Execute Hybrid Search
+    tracker.record_usage(op_id, embed_tokens, 0, settings.EMBEDDING_MODEL, "embedding")
+
     results = await hybrid_search(query, embedding, limit)
-    
+
     latency_ms = (time.time() - start_time) * 1000
-    
     metrics = tracker.end_operation(op_id)
     cost = metrics.cost_usd if metrics else 0.0
-    
-    search_logger.log_row({
-        "query_id": op_id,
-        "timestamp": start_time,
-        "query_texto": query,
-        "longitud_query": len(query),
-        "tipo_busqueda": "hybrid_rrf",
-        "tokens_embedding": embed_tokens,
-        "tokens_llm_in": 0,
-        "tokens_llm_out": 0,
-        "costo_embedding_usd": cost,
-        "costo_llm_usd": 0,
-        "costo_total_usd": cost,
-        "resultados_retornados": len(results),
-        "latencia_ms": latency_ms
-    })
-    
+
+    _log_search(op_id, start_time, query, "hybrid_rrf", embed_tokens, 0, 0, cost, 0.0, len(results), latency_ms)
+
     return [
         SearchResult(
-            content=r['content'], 
-            metadata={**(json.loads(r['metadata']) if isinstance(r['metadata'], str) else r['metadata']), "vector_score": r.get('vector_score'), "text_score": r.get('text_score')}, 
-            score=r['score'], 
-            source="postgres_hybrid"
-        ) for r in results
+            content=r["content"],
+            metadata={
+                **_parse_metadata(r["metadata"]),
+                "vector_score": r.get("vector_score"),
+                "text_score": r.get("text_score"),
+            },
+            score=r["score"],
+            source="postgres_hybrid",
+        )
+        for r in results
     ]
-
