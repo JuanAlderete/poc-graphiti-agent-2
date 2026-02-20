@@ -1,8 +1,10 @@
 import argparse
 import asyncio
+import json
 import logging
+import re
 import time
-from typing import Any
+from typing import Any, Optional
 
 from agent.config import settings
 from agent.db_utils import (
@@ -18,164 +20,161 @@ from poc.token_tracker import tracker
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+_MD_STRIP_STEPS = [
+    (re.compile(r"\[([^\]]*)\]\([^\)]*\)"), r"\1"),
+    (re.compile(r"#{1,6}\s+", re.MULTILINE), ""),
+    (re.compile(r"[*_`]{1,3}"), ""),
+    (re.compile(r"^\s*[-*+]\s+", re.MULTILINE), ""),
+    (re.compile(r"^\s*\d+\.\s+", re.MULTILINE), ""),
+    (re.compile(r"^>\s*", re.MULTILINE), ""),
+    (re.compile(r"\n{3,}"), "\n\n"),
+]
+
+
+def _strip_markdown(text: str) -> str:
+    result = text
+    for pattern, replacement in _MD_STRIP_STEPS:
+        result = pattern.sub(replacement, result)
+    return result.strip()
+
+
+async def _process_one_doc(
+    doc: dict[str, Any],
+    delay_before: float = 0.0,
+) -> tuple[str, float]:
+    source = doc.get("title") or doc.get("source", "unknown")
+    doc_id = doc["id"]
+
+    meta = doc.get("metadata", {})
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+
+    content = doc.get("content", "")
+    if not content.strip():
+        logger.warning("Skipping %s - empty content.", source)
+        return doc_id, 0.0
+
+    graphiti_context = meta.get("graphiti_ready_context")
+
+    if delay_before > 0:
+        logger.info("Waiting %.1fs before next episode...", delay_before)
+        await asyncio.sleep(delay_before)
+
+    content_clean = _strip_markdown(content)
+
+    await GraphClient.add_episode(
+        content=content_clean,
+        source_reference=doc.get("source", source),
+        source_description=graphiti_context,
+    )
+
+    await mark_document_graph_ingested(doc_id)
+
+    est_tokens_in = tracker.estimate_tokens(content_clean)
+    est_tokens_out = int(est_tokens_in * 0.30)
+    cost = calculate_cost(est_tokens_in, est_tokens_out, settings.DEFAULT_MODEL)
+    logger.info("Episode '%s' done - est. cost $%.4f", source, cost)
+
+    return doc_id, cost
+
 
 async def hydrate_graph(
     dry_run: bool = False,
     limit: int = 1000,
     reset_flags: bool = False,
+    delay_between_docs: float = 5.0,
 ) -> None:
     """
-    Lee documentos de Postgres y los ingesta en Graphiti (Neo4j).
+    Lee documentos de Postgres y los ingesta en Graphiti de forma SECUENCIAL.
 
     Args:
-        dry_run:     Si True, muestra qué se haría sin gastar tokens.
-        limit:       Máximo de documentos a procesar.
-        reset_flags: Si True, reprocesa todos los docs (ignora graph_ingested).
+        dry_run:            Preview sin gastar tokens.
+        limit:              Maximo de documentos a procesar.
+        reset_flags:        Si True, reprocesa todos (ignora graph_ingested).
+        delay_between_docs: Segundos entre episodios (default 5s).
     """
-    logger.info("=== HYDRATE GRAPH — Fase 2 ===")
+    logger.info("=== HYDRATE GRAPH - Fase 2 ===")
     await DatabasePool.init_db()
 
-    # ── Obtener documentos pendientes ─────────────────────────────────────────
     if reset_flags:
-        logger.info("--reset-flags activo: procesando TODOS los documentos.")
+        logger.info("--reset-flags: procesando TODOS los documentos.")
         docs = await get_all_documents(limit=limit)
     else:
         docs = await get_documents_missing_from_graph(limit=limit)
 
     if not docs:
-        logger.info("[OK] No hay documentos pendientes. El grafo está al día.")
+        logger.info("[OK] No hay documentos pendientes.")
         return
 
-    logger.info("Documentos a hidratar: %d", len(docs))
+    logger.info(
+        "Documentos a hidratar: %d | Modo: SECUENCIAL | Delay: %.1fs",
+        len(docs), delay_between_docs,
+    )
 
-    # ── Dry run ───────────────────────────────────────────────────────────────
     if dry_run:
-        logger.info("=== DRY RUN — no se gastarán tokens ===")
+        logger.info("=== DRY RUN ===")
         for doc in docs:
             meta = doc.get("metadata", {})
-            context = meta.get("graphiti_ready_context", "[sin contexto pre-calculado]")
-            people = meta.get("detected_people", [])
-            companies = meta.get("detected_companies", [])
-            logger.info(
-                "  DOC: %s\n    CONTEXT: %s\n    People: %s | Companies: %s",
-                doc["source"], context[:120], people[:5], companies[:5],
-            )
-        logger.info("=== DRY RUN completado (%d docs revisados) ===", len(docs))
+            context = meta.get("graphiti_ready_context", "[sin contexto]")
+            logger.info("  DOC: %s | CONTEXT: %s", doc["source"], context[:120])
+        logger.info("=== DRY RUN completado (%d docs) ===", len(docs))
         return
 
-    # ── Inicializar Graphiti (build_indices_and_constraints) ──────────────────
-    # Esto crea los índices necesarios en Neo4j una sola vez.
-    logger.info("Initializing Graphiti and ensuring Neo4j schema…")
+    logger.info("Initializing Graphiti...")
     await GraphClient.ensure_schema()
 
-    # ── Hidratación con concurrencia controlada ───────────────────────────────
-    # ── Hidratación con concurrencia controlada ───────────────────────────────
-    concurrency = 1  # Reduced to 1 to avoid 429s
-    sem = asyncio.Semaphore(concurrency)
     total_cost = 0.0
-    processed_ids: set[str] = set()  # FIXED: track éxitos por ID, no por costo
+    processed_ids: set[str] = set()
     error_count = 0
     t0 = time.time()
 
-    async def _process_doc(doc: dict[str, Any]) -> tuple[str, float]:
-        """
-        Procesa un único doc.
-        Retorna (doc_id, costo_estimado) o lanza excepción.
-        """
+    for i, doc in enumerate(docs, 1):
         source = doc.get("title") or doc.get("source", "unknown")
-        doc_id = doc["id"]
+        logger.info("--- [%d/%d] %s", i, len(docs), source)
 
-        async with sem:
-            # Add small delay to space out requests
-            await asyncio.sleep(0.5)
-            meta = doc.get("metadata", {})
-            if isinstance(meta, str):
-                import json
-                try:
-                    meta = json.loads(meta)
-                except Exception:
-                    meta = {}
-
-            content = doc.get("content", "")
-            if not content.strip():
-                logger.warning("Skipping %s — empty content.", source)
-                return doc_id, 0.0
-
-            graphiti_context = meta.get("graphiti_ready_context")
-
-            if graphiti_context:
-                logger.info("Hydrating: %s | Context: %.80s…", source, graphiti_context)
-            else:
-                logger.warning(
-                    "Hydrating: %s | No pre-calculated context. "
-                    "Re-ingestar con el pipeline actualizado mejora la calidad.",
-                    source,
-                )
-
-            await GraphClient.add_episode(
-                content=content,
-                source_reference=doc.get("source", source),
-                source_description=graphiti_context,
+        try:
+            doc_id, cost = await _process_one_doc(
+                doc,
+                delay_before=delay_between_docs if i > 1 else 0.0,
             )
-
-            # Marcar como hidratado para reanudar si se interrumpe
-            await mark_document_graph_ingested(doc_id)
-
-            # Estimación de costo para el resumen final
-            est_tokens_in = tracker.estimate_tokens(content)
-            est_tokens_out = int(est_tokens_in * 0.30)
-            cost = calculate_cost(est_tokens_in, est_tokens_out, settings.DEFAULT_MODEL)
-
-            return doc_id, cost
-
-    # Ejecutar en paralelo
-    results = await asyncio.gather(
-        *(_process_doc(doc) for doc in docs),
-        return_exceptions=True,
-    )
-
-    for r in results:
-        if isinstance(r, Exception):
-            error_count += 1
-            logger.error("Hydration task error: %s", r)
-        else:
-            doc_id, cost_val = r  # type: ignore[misc]
             processed_ids.add(doc_id)
-            total_cost += cost_val
+            total_cost += cost
+        except Exception as e:
+            error_count += 1
+            logger.error("Error en '%s': %s", source, e)
 
     elapsed = time.time() - t0
-    success_count = len(processed_ids)  # FIXED: count basado en IDs procesados
+    success_count = len(processed_ids)
 
-    # ── Resumen ───────────────────────────────────────────────────────────────
     logger.info("=" * 55)
     logger.info("HYDRATION COMPLETE")
     logger.info("  Documentos procesados : %d", len(docs))
     logger.info("  Exitosos              : %d", success_count)
     logger.info("  Errores               : %d", error_count)
-    logger.info("  Tiempo total          : %.1fs", elapsed)
+    logger.info("  Tiempo total          : %.1fs (%.1f min)", elapsed, elapsed / 60)
     logger.info("  Costo estimado total  : $%.4f", total_cost)
     logger.info("  Costo promedio/doc    : $%.4f", total_cost / max(success_count, 1))
     logger.info("=" * 55)
 
-    # ── Decisión GO/OPTIMIZE/STOP (proyección a 250 docs/mes) ────────────────
-    avg_cost = total_cost / max(success_count, 1)
-    monthly_projection = avg_cost * 250
-    if monthly_projection < 100:
-        logger.info("[GO] Proyección mensual (250 docs): $%.2f (< $100)", monthly_projection)
-    elif monthly_projection < 200:
-        logger.warning("[OPTIMIZE] Proyección mensual: $%.2f ($100–$200)", monthly_projection)
-    else:
-        logger.error("[STOP] Proyección mensual: $%.2f (> $200)", monthly_projection)
-
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fase 2: Hidratación de Graphiti desde Postgres")
-    parser.add_argument("--dry-run", action="store_true", help="Preview sin gastar tokens")
-    parser.add_argument("--limit", type=int, default=1000, help="Máximo de docs a procesar")
+    parser = argparse.ArgumentParser(description="Fase 2: Hidratacion de Graphiti")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument("--reset-flags", action="store_true")
     parser.add_argument(
-        "--reset-flags",
-        action="store_true",
-        help="Re-procesar todos los docs (ignora el flag graph_ingested)",
+        "--delay", type=float, default=5.0,
+        help="Segundos entre episodios (default 5). Usar 0 si el tier lo permite.",
     )
     args = parser.parse_args()
-    asyncio.run(hydrate_graph(dry_run=args.dry_run, limit=args.limit, reset_flags=args.reset_flags))
+    asyncio.run(
+        hydrate_graph(
+            dry_run=args.dry_run,
+            limit=args.limit,
+            reset_flags=args.reset_flags,
+            delay_between_docs=args.delay,
+        )
+    )

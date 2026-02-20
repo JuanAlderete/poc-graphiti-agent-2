@@ -14,7 +14,7 @@ Esta prueba de concepto valida si la arquitectura **Graphiti + PostgreSQL/pgvect
 6. [Estructura de archivos explicada](#estructura-de-archivos-explicada)
 7. [Flujo de datos de punta a punta](#flujo-de-datos-de-punta-a-punta)
 8. [Sistema de métricas y costos](#sistema-de-métricas-y-costos)
-9. [Dashboard](#dashboard)
+9. [Optimizaciones de costo implementadas](#optimizaciones-de-costo-implementadas)
 10. [Criterios de éxito (GO / OPTIMIZE / STOP)](#criterios-de-éxito)
 11. [Preguntas frecuentes](#preguntas-frecuentes)
 
@@ -24,7 +24,7 @@ Esta prueba de concepto valida si la arquitectura **Graphiti + PostgreSQL/pgvect
 
 El cliente tiene una base de conocimiento (transcripciones de podcasts, guías, playbooks) y necesita un agente que pueda responder preguntas usando esa información. La duda es: **¿cuánto cuesta realmente operar esto a escala?**
 
-Este POC responde esa pregunta midiendo el costo exacto (en USD) de cada operación: ingestar un documento, hacer una búsqueda, generar un email. Con esos datos, el dashboard proyecta el gasto mensual y anual bajo distintos escenarios.
+Este POC responde esa pregunta midiendo el costo exacto (en USD) de cada operación: ingestar un documento, hacer una búsqueda, generar un email. Con esos datos, el sistema proyecta el gasto mensual y anual bajo distintos escenarios.
 
 La arquitectura también resuelve un problema técnico: ¿cómo activar un knowledge graph sin tirar todo lo que ya está corriendo? La respuesta es la **migración por hidratación** — los documentos ya guardados en Postgres se pueden "hidratar" a Neo4j en un paso separado, sin re-ingestar archivos ni interrumpir el servicio.
 
@@ -36,43 +36,39 @@ La arquitectura también resuelve un problema técnico: ¿cómo activar un knowl
 Documentos (.md)
       │
       ▼
-┌─────────────────────────────┐
-│   ingestion/ingest.py       │  Pipeline de ingesta
-│                             │
-│  1. Parsea frontmatter YAML │
-│  2. Extrae entidades (gratis│  ← sin LLM, solo regex
-│  3. Chunking por segmentos  │
-│  4. Genera embeddings       │  ← OpenAI / Gemini
-│  5. Guarda en Postgres      │
-│  6. (Opcional) → Graphiti   │
-└─────────────────────────────┘
+┌──────────────────────────────┐
+│   ingestion/ingest.py        │  Pipeline de ingesta
+│                              │
+│  1. Parsea frontmatter YAML  │
+│  2. Extrae entidades (gratis)│  <- sin LLM, solo regex
+│  3. Strip Markdown           │  <- reduce tokens Graphiti
+│  4. Chunking por segmentos   │
+│  5. Genera embeddings        │  <- OpenAI / Gemini
+│  6. Guarda en Postgres       │
+│  7. (Opcional) -> Graphiti   │  <- truncado a 6000 chars
+└──────────────────────────────┘
          │                │
          ▼                ▼
   ┌────────────┐    ┌───────────┐
   │ PostgreSQL │    │  Neo4j    │
   │ (pgvector) │    │(Graphiti) │
   └────────────┘    └───────────┘
-         │                │
+         │                 │
          └───────┬─────────┘
                  ▼
         ┌─────────────────┐
         │  agent/tools.py │  Capa de búsqueda
         │                 │
-        │ • vector_search │  ← cosine similarity
-        │ • graph_search  │  ← relaciones/entidades
-        │ • hybrid_search │  ← RRF (combina ambas)
+        │ • vector_search │  <- cosine similarity (top 3)
+        │ • graph_search  │  <- relaciones/entidades (top 3)
+        │ • hybrid_search │  <- RRF (combina ambas) (top 3)
         └─────────────────┘
                  │
                  ▼
         ┌─────────────────┐
         │ poc/content_    │  Generación de contenido
         │ generator.py    │  (emails, reels, historias)
-        └─────────────────┘
-                 │
-                 ▼
-        ┌─────────────────┐
-        │ poc/token_      │  Tracking de costos
-        │ tracker.py      │  (cada operación loguea USD)
+        │                 │  max_tokens por formato
         └─────────────────┘
 ```
 
@@ -82,28 +78,20 @@ Documentos (.md)
 - **Neo4j** como base de datos del knowledge graph
 - **Graphiti** (`graphiti-core`) para extracción automática de entidades y relaciones
 - **OpenAI** o **Gemini** como proveedor de LLM y embeddings (configurable)
-- **Streamlit** para el dashboard de métricas
 
 ---
 
 ## Estrategia de despliegue por fases
 
-El proyecto está diseñado para crecer sin deuda técnica. Cada fase es un subset de la siguiente.
-
 ### Fase 1 — Vector Only (Lanzamiento productivo)
 
 **Objetivo:** velocidad máxima, costo mínimo.
 
-Solo se usa Postgres/pgvector. No se instala Neo4j, no se llama a Graphiti. El costo de ingesta es casi exclusivamente el embedding del texto (~$0.02/1M tokens).
+Solo se usa Postgres/pgvector. No se instala Neo4j, no se llama a Graphiti.
 
 ```bash
-# Ingestar documentos sin Graphiti
 python -m poc.run_poc --ingest documents_to_index/ --skip-graphiti
-
-# Búsquedas disponibles: vector y hybrid (RRF vector + full-text)
 ```
-
-Cuándo usar esta fase: arranque del proyecto, validación de calidad de búsqueda, cuando el volumen de datos es bajo y las preguntas son "semánticas" (no relacionales).
 
 ---
 
@@ -111,27 +99,23 @@ Cuándo usar esta fase: arranque del proyecto, validación de calidad de búsque
 
 **Objetivo:** preparar la base de datos para que la migración al grafo sea más barata y precisa.
 
-Durante la ingesta normal (Fase 1), el pipeline ahora extrae automáticamente metadatos estructurados **sin gastar ni un token de LLM**:
+Durante la ingesta normal, el pipeline extrae automáticamente metadatos estructurados **sin gastar ni un token de LLM**:
 
-- **Personas detectadas**: regex sobre el bloque "Participantes:" o nombres Nombre Apellido en el texto.
-- **Empresas y herramientas**: palabras con mayúscula que aparecen ≥2 veces (Aerolab, Clay, Neo4j, etc.).
-- **Segmentos temporales**: timestamps `[MM:SS]` del formato Novotalks, usados como límites de chunk.
-- **Citas destacadas**: bloques `> "..."` del markdown.
-- **`graphiti_ready_context`**: un string pre-formateado con todo lo anterior, listo para inyectar en Graphiti.
+- **Personas detectadas:** regex sobre el bloque "Participantes:" o nombres Nombre Apellido en el texto.
+- **Empresas y herramientas:** palabras con mayúscula que aparecen ≥2 veces.
+- **Segmentos temporales:** timestamps `[MM:SS]` del formato Novotalks, usados como límites de chunk.
+- **Citas destacadas:** bloques `> "..."` del markdown.
+- **`graphiti_ready_context`:** string pre-formateado con todo lo anterior, listo para Graphiti.
 
-Ejemplo de lo que se genera automáticamente para un documento:
-
+Ejemplo de contexto generado automáticamente:
 ```
 Document: Agustín Linenberg - Ventas y Startups | Category: Podcast |
-People: Agustín Linenberg, Wences Casares, Dami, Tommy |
-Organizations: Aerolab, Clay, Lemon Wallet, Neo4j |
+People: Agustín Linenberg, Wences Casares |
+Organizations: Aerolab, Clay, Lemon Wallet |
 Topics: Perfil Personal; Emprender por Accidente; Ventas por Relación
 ```
 
-Este contexto se guarda en `documents.metadata` (columna JSONB). Cuando llegue Fase 2, Graphiti lo recibe como `source_description` en `add_episode()` y puede enfocar la extracción directamente en las entidades correctas, en lugar de inferirlas desde cero.
-
-Cómo agregar frontmatter a tus documentos para enriquecer aún más los metadatos:
-
+Frontmatter opcional para enriquecer metadatos:
 ```yaml
 ---
 title: "Agustín Linenberg: El Arte de Emprender"
@@ -149,29 +133,21 @@ date: 2024-03-15
 
 **Objetivo:** activar el knowledge graph para preguntas relacionales complejas.
 
-En lugar de re-ingestar todos los archivos, se usa el script `poc/hydrate_graph.py` que lee los documentos ya guardados en Postgres y los envía a Graphiti. El proceso es **reanudable**: si se corta, la próxima ejecución continúa desde donde quedó usando el flag `metadata->>'graph_ingested'`.
-
 ```bash
-# Preview: ver qué documentos se procesarían y con qué contexto
+# Preview: ver qué documentos se procesarían
 python -m poc.hydrate_graph --dry-run
 
-# Ejecutar la migración
+# Ejecutar la migración (secuencial, 5s entre episodios)
 python -m poc.hydrate_graph
 
-# Solo los primeros 10 documentos (para validar costos antes de escalar)
+# Solo los primeros 10 (validar costos antes de escalar)
 python -m poc.hydrate_graph --limit 10
 
-# Re-procesar todos (ignorar el flag de ya-hidratado)
+# Sin pausa entre episodios (si el tier de API lo permite)
+python -m poc.hydrate_graph --delay 0
+
+# Re-procesar todos
 python -m poc.hydrate_graph --reset-flags
-```
-
-Una vez hidratado el grafo, están disponibles los tres modos de búsqueda:
-
-```bash
-# Búsqueda vectorial (rápida, semántica)
-# Búsqueda en grafo (relaciones, entidades, hechos)
-# Búsqueda híbrida (combina ambas con RRF)
-python -m poc.run_poc --search
 ```
 
 ---
@@ -179,7 +155,6 @@ python -m poc.run_poc --search
 ## Instalación y configuración
 
 ### Requisitos
-
 - Python 3.10+
 - Docker (para Postgres y Neo4j)
 
@@ -197,88 +172,56 @@ pip install -r requirements.txt
 docker-compose up -d
 ```
 
-Esto levanta:
-- **PostgreSQL** con extensión `pgvector` en el puerto 5432
-- **Neo4j** en el puerto 7687 (bolt) y 7474 (browser web)
+### 3. Configurar variables de entorno
 
-### 3. Configurar el archivo `.env`
+```bash
+cp .env.example .env
+```
 
-Copiar `.env.example` y completar:
-
-```env
-# Proveedor LLM: "openai" o "gemini"
-LLM_PROVIDER=openai
+Editar `.env`:
+```
 OPENAI_API_KEY=sk-...
-
-# Alternativa Gemini
-# LLM_PROVIDER=gemini
-# GEMINI_API_KEY=AI...
-
-# PostgreSQL
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=password
-POSTGRES_DB=graphiti_poc
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-
-# Neo4j (solo necesario en Fase 2)
+DEFAULT_MODEL=gpt-5-mini
+EMBEDDING_MODEL=text-embedding-3-small
+LLM_PROVIDER=openai
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=password
-
-# Modelos (opcional, se auto-configuran según el proveedor)
-# DEFAULT_MODEL=gpt-4o-mini
-# EMBEDDING_MODEL=text-embedding-3-small
+POSTGRES_DSN=postgresql://user:password@localhost:5432/graphiti_poc
 ```
-
-**Nota sobre modelos:** si `LLM_PROVIDER=gemini`, el sistema automáticamente usa `gemini-1.5-flash` y `text-embedding-004`. Si `LLM_PROVIDER=openai`, usa `gpt-5-mini` y `text-embedding-3-small`. Se pueden sobreescribir en el `.env`.
-
-### 4. Verificar que todo funciona
-
-```bash
-python -m poc.check_system
-```
-
-Esto verifica conexión a Postgres, Neo4j (si está configurado), y que las API keys sean válidas.
 
 ---
 
 ## Cómo correr el proyecto
 
-### Flujo completo (recomendado para el POC)
+### Flujo completo (ingesta + búsquedas + generación)
 
 ```bash
-# Paso 1: Ingestar documentos (Fase 1 - sin grafo)
-python -m poc.run_poc --ingest documents_to_index/ --skip-graphiti
-
-# Paso 2: Correr búsquedas de prueba
-python -m poc.run_poc --search --skip-graphiti
-
-# Paso 3: Generar contenido de prueba
-python -m poc.run_poc --generate
-
-# Paso 4: Ver métricas en el dashboard
-streamlit run dashboard/app.py
+python -m poc.run_poc --clear-logs --clear-db --ingest "documents_to_index" --all
 ```
 
-### Comandos individuales útiles
+### Solo ingesta vectorial (sin Graphiti, más rápido y barato)
 
 ```bash
-# Correr todo en un comando
-python -m poc.run_poc --all --ingest documents_to_index/
+python -m poc.run_poc --ingest documents_to_index/ --skip-graphiti
+```
 
-# Limpiar la base de datos y los logs antes de un run fresco
-python -m poc.run_poc --clear-db --clear-logs --ingest documents_to_index/ --skip-graphiti
+### Solo búsquedas de prueba
 
-# Saltear el health check (más rápido si ya sabés que todo está up)
-python -m poc.run_poc --ingest documents_to_index/ --skip-checks --skip-graphiti
-
-# Hidratación al grafo (Fase 2)
-python -m poc.hydrate_graph --dry-run    # primero revisar
-python -m poc.hydrate_graph              # ejecutar
-
-# Solo búsquedas con grafo activado
+```bash
 python -m poc.run_poc --search
+```
+
+### Solo generación de contenido
+
+```bash
+python -m poc.run_poc --generate
+```
+
+### Hidratar Graphiti desde Postgres (Fase 2)
+
+```bash
+python -m poc.hydrate_graph --limit 5
 ```
 
 ---
@@ -287,61 +230,31 @@ python -m poc.run_poc --search
 
 ```
 poc-graphiti-agent/
-│
-├── agent/                      ← Capa de acceso a datos y búsqueda
-│   ├── config.py               ← Re-exporta poc/config.py (backward compat)
-│   ├── db_utils.py             ← Pool de conexiones Postgres + helpers CRUD
-│   ├── gemini_client.py        ← Adaptador LLMClient de Graphiti para Gemini
-│   ├── graph_utils.py          ← Wrapper de Graphiti/Neo4j
-│   ├── models.py               ← Modelos Pydantic (SearchResult, etc.)
-│   └── tools.py                ← Las 3 herramientas de búsqueda del agente
-│
-├── ingestion/                  ← Pipeline de procesamiento de documentos
-│   ├── chunker.py              ← Divide texto en chunks con overlap
-│   ├── embedder.py             ← Genera vectores (OpenAI o Gemini), singleton
-│   └── ingest.py               ← Orquesta todo el pipeline de ingesta
-│
-├── poc/                        ← Scripts del POC y sistema de métricas
-│   ├── config.py               ← Configuración central + precios de modelos
-│   ├── token_tracker.py        ← Singleton thread-safe para contar tokens
-│   ├── cost_calculator.py      ← Calcula USD a partir de tokens y modelo
-│   ├── logging_utils.py        ← Loggers CSV para ingesta, búsqueda y generación
-│   ├── content_generator.py    ← Genera contenido usando el LLM configurado
-│   ├── hydrate_graph.py        ← Migración Postgres → Graphiti (Fase 2)
-│   ├── run_poc.py              ← Script principal, entry point del POC
-│   ├── check_system.py         ← Health check de conexiones y variables
-│   ├── queries.py              ← 20 queries de prueba (vector, graph, hybrid)
-│   └── prompts/                ← Templates de generación de contenido
-│       ├── email.py
-│       ├── historia.py
-│       ├── reel_cta.py
-│       └── reel_lead_magnet.py
-│
-├── dashboard/                  ← Interfaz visual Streamlit
-│   ├── app.py                  ← App principal con tabs de métricas
-│   └── utils.py                ← Helpers de visualización
-│
-├── sql/
-│   └── schema.sql              ← Definición de tablas, índices y funciones SQL
-│
-├── documents_to_index/         ← Documentos de prueba (transcripciones Novotalks)
-│   ├── agustin.md
-│   ├── alex.md
-│   ├── andres.md
-│   ├── cristobal.md
-│   └── lucas.md
-│
-├── tests/poc/
-│   ├── test_token_tracker.py
-│   └── test_cost_calculator.py
-│
-├── logs/                       ← Generado automáticamente al correr el POC
-│   ├── ingesta_log.csv
-│   ├── busqueda_log.csv
-│   ├── generacion_log.csv
-│   └── poc_execution.log
-│
-├── .env.example
+├── agent/
+│   ├── config.py                 # Variables de entorno (Settings con Pydantic)
+│   ├── custom_openai_client.py   # Cliente OpenAI con fixes para gpt-5-mini y retry
+│   ├── db_utils.py               # Pool de conexiones Postgres + queries
+│   ├── gemini_client.py          # Cliente Gemini para Graphiti
+│   ├── graph_utils.py            # Wrapper Graphiti/Neo4j
+│   ├── models.py                 # Modelos Pydantic (SearchResult, etc.)
+│   └── tools.py                  # Herramientas de búsqueda (vector/graph/hybrid)
+├── ingestion/
+│   ├── chunker.py                # RecursiveChunker (chunk_size=800, overlap=100)
+│   ├── embedder.py               # EmbeddingGenerator con cache de queries
+│   └── ingest.py                 # Pipeline completo de ingesta
+├── poc/
+│   ├── check_system.py           # Health check pre-vuelo
+│   ├── config.py                 # Precios de modelos para tracking de costos
+│   ├── content_generator.py      # Generador de contenido con límites de tokens
+│   ├── cost_calculator.py        # Calcula costo USD por operación
+│   ├── hydrate_graph.py          # Migración secuencial Postgres -> Neo4j
+│   ├── logging_utils.py          # Loggers CSV por tipo de operación
+│   ├── prompts/                  # Templates por formato (email, reel, historia)
+│   ├── queries.py                # 20 queries de prueba (vector/graph/hybrid)
+│   ├── run_poc.py                # Entrypoint principal
+│   └── token_tracker.py          # Singleton de tracking de tokens y costos
+├── documents_to_index/           # Documentos .md a ingestar
+├── logs/                         # CSVs de métricas generados automáticamente
 ├── docker-compose.yml
 ├── requirements.txt
 └── README.md
@@ -351,227 +264,131 @@ poc-graphiti-agent/
 
 ## Flujo de datos de punta a punta
 
-### Ingesta de un documento
+### Ingesta (`ingest.py`)
 
-Cuando llamás a `ingest_file("agustin.md")`, ocurre lo siguiente:
+1. **Lectura:** carga el archivo `.md` en memoria.
+2. **Deduplicación:** calcula SHA256 del contenido; si ya existe en Postgres, saltea.
+3. **Frontmatter:** extrae metadatos YAML del bloque `---`.
+4. **Extracción heurística (sin LLM):** personas, empresas, citas, segmentos temporales.
+5. **Strip de Markdown:** elimina `##`, `**`, `>`, `-`, etc. antes de enviar a Graphiti (ahorra 5-15% de tokens).
+6. **Chunking:** divide el texto en chunks de 800 chars con 100 de overlap.
+7. **Embedding:** genera vectores en batch (una sola llamada a la API).
+8. **Postgres:** guarda documento y chunks con sus embeddings.
+9. **Graphiti (opcional):** envía el texto (truncado a 6.000 chars) para extracción de entidades y relaciones.
 
-**1. Deduplicación**
-Se calcula un hash SHA-256 del contenido crudo. Si ya existe un documento con ese hash en Postgres (`metadata->>'content_hash'`), se saltea. Esto permite re-ejecutar el script sin duplicar datos.
+### Búsqueda (`tools.py`)
 
-**2. Parseo de frontmatter**
-Se extrae el bloque YAML entre `---`. Si no hay frontmatter, el doc se procesa igual usando el nombre de archivo como título.
+- **`vector_search_tool`:** embeddea la query (con cache), busca por cosine similarity en Postgres, retorna top-3.
+- **`graph_search_tool`:** busca hechos y relaciones en Neo4j via Graphiti, retorna top-3.
+- **`hybrid_search_tool`:** combina vector + full-text con Reciprocal Rank Fusion (RRF), retorna top-3.
 
-**3. Extracción heurística de entidades (costo $0)**
-Sin llamar a ningún LLM, se detectan:
-- **Personas**: regex sobre el bloque "Participantes:" y patrones `Nombre Apellido:` en el texto.
-- **Empresas/herramientas**: palabras con mayúscula inicial que aparecen ≥2 veces en el documento.
-- **Segmentos temporales**: líneas con `[MM:SS]` usadas como límites de chunk.
-- **Citas**: bloques `> "texto"` del formato markdown.
+### Generación (`content_generator.py`)
 
-Todo esto se serializa como JSON y se guarda en `documents.metadata`, incluyendo el campo `graphiti_ready_context` (un string descriptivo listo para Graphiti).
-
-**4. Chunking**
-Si el documento tiene segmentos temporales detectados, se divide respetándolos como fronteras naturales. Cada sección temática `[12:30] - Ventas por Relación` se convierte en su propio chunk. Si no hay timestamps, se usa el `SemanticChunker` con overlap configurable.
-
-**5. Embedding**
-Se llama a `embedder.generate_embeddings_batch(chunks)` usando el singleton `get_embedder()`. Los tokens usados se registran en el `TokenTracker`.
-
-**6. Persistencia en Postgres**
-Se insertan:
-- Un registro en `documents` con el contenido completo y toda la metadata.
-- N registros en `chunks`, cada uno con su vector de embedding y su propia metadata (nombre del doc padre, índice, título del segmento).
-
-**7. Ingesta en Graphiti (opcional)**
-Si no se pasó `--skip-graphiti`, se llama a `GraphClient.add_episode()` con el contenido y el `graphiti_ready_context` como `source_description`. Graphiti procesa el texto, extrae nodos (entidades) y aristas (relaciones) y los guarda en Neo4j.
-
----
-
-### Búsqueda
-
-Hay tres modos:
-
-**Vector search** (`vector_search_tool`):
-1. Genera embedding de la query.
-2. Ejecuta `SELECT ... ORDER BY embedding <=> $1 LIMIT $2` contra la tabla `chunks`.
-3. Retorna los N chunks más similares con sus scores.
-
-**Graph search** (`graph_search_tool`):
-1. Llama a `GraphClient.search(query)`.
-2. Graphiti ejecuta internamente un pipeline que combina búsqueda semántica en Neo4j con razonamiento sobre las relaciones del grafo.
-3. Retorna resultados como strings descriptivos de hechos y relaciones.
-
-**Hybrid search** (`hybrid_search_tool`):
-1. Genera embedding de la query.
-2. Llama a la función SQL `hybrid_search()` definida en `schema.sql`.
-3. Esta función combina los rankings de similitud coseno (vector) y `ts_rank` (full-text) mediante **Reciprocal Rank Fusion (RRF)**.
-4. RRF fusiona los dos rankings con la fórmula `1/(k + rank)` donde `k=60` por defecto, dándole peso configurable a cada señal.
-
----
-
-### Hidratación del grafo (Fase 2)
-
-`poc/hydrate_graph.py` orquesta la migración:
-
-1. Llama a `get_documents_missing_from_graph()` — consulta Postgres filtrando por `metadata->>'graph_ingested' IS NOT TRUE`. Gracias al índice parcial en el schema, esta query es eficiente incluso con miles de documentos.
-2. Por cada documento, extrae el `graphiti_ready_context` pre-calculado y lo inyecta como `source_description` en `GraphClient.add_episode()`.
-3. Una vez procesado, llama a `mark_document_graph_ingested(doc_id)` que hace un `metadata || '{"graph_ingested": true}'::jsonb` — actualización atómica sin reescribir todo el JSONB.
-4. Al final, muestra el costo total estimado y proyección mensual con decisión GO/OPTIMIZE/STOP.
+Recibe los resultados de búsqueda como contexto, los inyecta en el template del formato solicitado, y llama al LLM con un límite de tokens por formato (email: 300, reel: 250, historia: 500).
 
 ---
 
 ## Sistema de métricas y costos
 
-### TokenTracker (`poc/token_tracker.py`)
+Cada operación genera una fila en los logs CSV:
 
-Singleton thread-safe (con `threading.Lock`) que vive durante toda la ejecución. Cada operación tiene un ciclo de vida:
-
-```python
-# Inicio de una operación
-tracker.start_operation("ingest_agustin_1234", "ingestion")
-
-# Registro de uso (puede llamarse múltiples veces por operación)
-tracker.record_usage(op_id, tokens_in=450, tokens_out=0, model="text-embedding-3-small", detail_name="embedding")
-
-# Fin y obtención de métricas acumuladas
-metrics = tracker.end_operation(op_id)
-# metrics.tokens_in, metrics.tokens_out, metrics.cost_usd, metrics.details
-```
-
-Si `tiktoken` está disponible, cuenta tokens con exactitud. Si no, usa la heurística `len(text) // 4`.
-
-### CostCalculator (`poc/cost_calculator.py`)
-
-Multiplica tokens por los precios definidos en `MODEL_PRICING` dentro de `poc/config.py`:
-
-| Modelo | Input ($/1M tokens) | Output ($/1M tokens) |
-|--------|---------------------|----------------------|
-| `gpt-5-mini` | $0.080 | $0.320 |
-| `gpt-4o-mini` | $0.150 | $0.600 |
-| `gemini-1.5-flash` | $0.075 | $0.300 |
-| `text-embedding-3-small` | $0.020 | — |
-| `text-embedding-004` | $0.025 | — |
-
-### Logs CSV (`logs/`)
-
-Cada operación escribe en uno de tres archivos CSV thread-safe:
-
-**`ingesta_log.csv`** — Una fila por documento ingestado:
-`episodio_id, timestamp, nombre_archivo, longitud_palabras, chunks_creados, embeddings_tokens, entidades_detectadas, costo_total_usd, tiempo_seg`
-
-**`busqueda_log.csv`** — Una fila por búsqueda ejecutada:
-`query_id, timestamp, query_texto, tipo_busqueda, tokens_embedding, tokens_llm_in, tokens_llm_out, costo_total_usd, resultados_retornados, latencia_ms`
-
-**`generacion_log.csv`** — Una fila por pieza de contenido generada:
-`pieza_id, timestamp, formato, tema_base, tokens_contexto_in, tokens_prompt_in, tokens_out, modelo, provider, costo_usd, tiempo_seg, longitud_output_chars`
+| Log | Contenido |
+|-----|-----------|
+| `logs/ingesta_log.csv` | Costo por documento ingestado, tokens usados, tiempo |
+| `logs/busqueda_log.csv` | Costo por query, tipo de búsqueda, latencia |
+| `logs/generacion_log.csv` | Costo por pieza generada, tokens in/out, formato |
 
 ---
 
-## Archivos clave en detalle
+## Optimizaciones de costo implementadas
 
-### `agent/db_utils.py`
+Esta sección documenta todos los cambios técnicos realizados para reducir el consumo de tokens y corregir errores que causaban pérdidas de costo.
 
-Gestiona toda la interacción con PostgreSQL usando `asyncpg` con un pool de conexiones (min=2, max=10). Funciones principales:
+### Bugs corregidos
 
-- `DatabasePool.init_db()` — Crea las extensiones y aplica `schema.sql` si la tabla no existe. Detecta automáticamente si usar `vector(1536)` (OpenAI) o `vector(768)` (Gemini).
-- `insert_document(title, source, content, metadata)` — Inserta en la tabla `documents` y retorna el UUID.
-- `insert_chunks(doc_id, chunks, embeddings, chunk_metas)` — Inserta en batch en la tabla `chunks` usando `_fmt_vec()` para el formato correcto de pgvector.
-- `document_exists_by_hash(hash)` — Consulta `metadata->>'content_hash'` para deduplicación.
-- `get_documents_missing_from_graph(limit)` — Para `hydrate_graph.py`. Usa el índice parcial en `graph_ingested`.
-- `mark_document_graph_ingested(doc_id)` — Actualiza el flag JSONB atómicamente.
-- `vector_search(embedding, limit)` — Búsqueda cosine similarity.
-- `hybrid_search(text, embedding, limit)` — Llama a la función SQL `hybrid_search()`.
+#### BUG 1: UnicodeEncodeError en Windows — `custom_openai_client.py`
+**Síntoma:** El sistema loggeaba un "Logging error" al arrancar en Windows y el mensaje de inicialización de Graphiti fallaba silenciosamente.
 
-### `agent/graph_utils.py`
+**Causa raíz:** El mensaje de log usaba la flecha unicode `→` (U+2192). La consola de Windows con encoding `cp1252` no puede encodear ese carácter, y el módulo `logging` lanzaba una excepción interna.
 
-Wrapper sobre `graphiti-core`. Se inicializa lazy (la primera vez que se llama a `get_client()`).
-
-- Soporta OpenAI y Gemini como backend del LLM de Graphiti.
-- `add_episode(content, source_reference, source_description)` — El parámetro `source_description` es el punto de entrada del contexto pre-calculado. Sin él, Graphiti gasta más tokens intentando inferir el tipo y contenido del documento.
-- `search(query)` — Búsqueda semántica + relacional en el grafo.
-- Estima el costo de cada episodio usando un ratio de 30% output/input (basado en el comportamiento real de Graphiti, más conservador que el 50% teórico).
-
-### `ingestion/embedder.py`
-
-Generador de embeddings con patrón singleton via `@lru_cache` en `get_embedder()`. Esto evita crear un nuevo cliente HTTP por cada búsqueda o ingesta.
-
-- Para OpenAI: llama a `AsyncOpenAI.embeddings.create()` de forma nativa async.
-- Para Gemini: `embed_content()` es sincrónico, por eso se envuelve en `asyncio.to_thread()` para no bloquear el event loop.
-- `generate_embeddings_batch(texts)` — Procesa una lista de textos en un solo llamado API y retorna `(embeddings, total_tokens)`.
-
-### `poc/config.py`
-
-Configuración central usando Pydantic v2 `BaseSettings`. Lee del `.env` automáticamente. Usa un `@model_validator(mode="after")` para resolver los modelos por defecto de Gemini en el momento de construcción (no después), evitando mutaciones post-construcción que Pydantic v2 no permite.
-
-### `sql/schema.sql`
-
-Además de las tablas estándar, define:
-
-- **Índice HNSW** en `chunks.embedding` para búsqueda aproximada de vecinos eficiente.
-- **Índice GIN** en `content_tsvector` (columna generada) para full-text search.
-- **Índice parcial** en `metadata->>'graph_ingested'` — solo indexa los documentos *no* hidratados, lo que lo mantiene pequeño y rápido.
-- **Índice en `content_hash`** para deduplicación O(log n).
-- **Función `hybrid_search()`** — implementa RRF en PL/pgSQL directamente en la base de datos.
-- **Vista `v_document_summary`** — resumen por documento: cuántos chunks tiene, si fue hidratado al grafo, tokens totales.
+**Fix:** Todos los mensajes de log ahora usan únicamente caracteres ASCII (`->`).
 
 ---
 
-## Dashboard
-
-```bash
-streamlit run dashboard/app.py
+#### BUG 2: LengthFinishReasonError en todos los episodios — `custom_openai_client.py`
+**Síntoma:** 100% de las llamadas a `add_episode()` fallaban con:
+```
+LengthFinishReasonError: Could not parse response content as the length limit was reached
+completion_tokens=2048, reasoning_tokens=2048
 ```
 
-El dashboard tiene **seis tabs** principales:
+**Causa raíz:** `gpt-5-mini` es un **modelo de razonamiento** (familia `o1`). Antes de producir output visible, consume *reasoning_tokens* de forma interna. Con el límite heredado de `graphiti-core` (`DEFAULT_MAX_TOKENS = 2048`), el modelo usaba los 2048 tokens **enteros** en razonamiento, dejando 0 tokens para el JSON estructurado que Graphiti necesita parsear.
 
-1.  **📥 Ingesta**: Trigger para procesar nuevos documentos. Opción `--skip-graphiti` para iteración rápida.
-2.  **🧠 Knowledge Base**: Visor de la base de datos. Muestra todos los documentos ingestados, conteo de chunks y metadata extraída. Permite filtrar por nombre.
-3.  **🔍 Búsqueda**: Interfaz para probar Vector, Graph y Hybrid search. Incluye un **Debug Mode** para inspeccionar el JSON crudo y los scores RRF.
-4.  **✨ Generación**: Templates predefinidos (Email, Historia, Reel) y un nuevo **Modo Custom** para experimentar con prompts libres.
-5.  **📊 Analytics**: Métricas de costo total y gráficos de evolución temporal por tipo de operación (Ingesta, Búsqueda, Generación).
-6.  **📈 Proyecciones**: Calculadora de ROI y estimación de costos mensuales según volumen esperado.
+El log lo confirmaba: `reasoning_tokens=2048` en cada intento fallido.
 
-**Acciones de la Sidebar**:
-- **🗑️ Clear Logs & DB**: Limpieza total para reiniciar pruebas.
-- **💧 Re-hydrate Graph**: Forza la ingesta de documentos pendientes desde Postgres hacia Neo4j sin re-procesar embeddings.
+**Fix:** Para modelos de razonamiento (`gpt-5-*`, `o1-*`), se fuerza `max_completion_tokens = 8192`. El peor caso observado en los logs (prompt ~19.6k tokens) requiere ~4.000-5.000 reasoning tokens + ~400 para el JSON de output. Los tokens no usados no se facturan.
+
+---
+
+#### BUG 3: CancelledError en archivos pendientes — `ingestion/ingest.py`
+**Síntoma:** Dos archivos fallaban por BUG 2 y los tres archivos restantes recibían `CancelledError` en lugar de procesarse normalmente.
+
+**Causa raíz:** `ingest_file()` hacía `raise` en su bloque `except`, propagando la excepción hacia el `asyncio.gather()`. Aunque `gather()` usaba `return_exceptions=True`, en Python 3.13 las tareas que estaban *esperando adquirir el semáforo* recibían `CancelledError` al detectar que el semáforo fue liberado por una excepción.
+
+**Fix:** `ingest_file()` ya no hace `re-raise`. Loggea el error con `logger.exception()` y retorna `None`. El `gather()` ve `None` (no `Exception`) y continúa con los archivos restantes sin interrupciones.
+
+---
+
+### Optimizaciones de costo
+
+| Módulo | Cambio | Ahorro estimado |
+|--------|--------|-----------------|
+| `agent/custom_openai_client.py` | `small_model` forzado a `medium_model` (evita `gpt-4.1-nano` con límite TPM 200k) | Elimina rate limits en ingesta |
+| `agent/custom_openai_client.py` | Retry con backoff exponencial ante 429 (5 intentos: 10/20/40/80/160s) | Recupera episodios que antes se perdían |
+| `agent/graph_utils.py` | Truncado de `episode_body` a **6.000 chars** antes de `add_episode()` | ~60% de tokens en Graphiti |
+| `agent/tools.py` | Resultados de búsqueda: **5 → 3** (vector, hybrid, graph) | ~400 tokens de input por query |
+| `ingestion/ingest.py` | Strip de sintaxis Markdown antes de Graphiti | 5-15% de tokens por episodio |
+| `ingestion/chunker.py` | `chunk_size`: 1000 → **800**, `chunk_overlap`: 200 → **100** | ~50% de tokens duplicados en embedding |
+| `ingestion/embedder.py` | Cache LRU de **256 entradas** para queries repetidas | Queries repetidas: $0 y latencia cero |
+| `poc/content_generator.py` | `max_tokens` por formato (email: 300, reel: 250, historia: 500) | 50-80% del costo de generación |
+| `poc/hydrate_graph.py` | Procesamiento **secuencial** con delay configurable (`--delay 5`) | Elimina rate limits en hidratación |
 
 ---
 
 ## Criterios de éxito
 
-El POC usa estos umbrales para decidir si escalar a producción:
+### GO — Seguir adelante con producción
 
-| Decisión | Costo por episodio | Costo mensual | Costo anual |
-|----------|--------------------|---------------|-------------|
-| ✅ **GO** | < $0.40 | < $100 | < $1,500 |
-| ⚠️ **OPTIMIZE** | $0.40 – $0.70 | $100 – $200 | $1,500 – $3,000 |
-| 🛑 **STOP** | > $0.70 | > $200 | > $3,000 |
+- Costo de ingesta < $0.10 por documento
+- Costo promedio por query < $0.001
+- Latencia de búsqueda < 2 segundos
+- Proyección mensual (250 docs) < $100
 
-Un "episodio" es la ingesta de un documento completo a Graphiti (extracción de entidades + relaciones). La Fase 1 (solo embeddings) tiene un costo órdenes de magnitud menor y no entra en esta evaluación.
+### OPTIMIZE — Ajustar antes de escalar
+
+- Costo por documento: $0.10 - $0.25
+- Proyección mensual: $100 - $200
+
+### STOP — Re-evaluar arquitectura
+
+- Costo por documento > $0.25
+- Proyección mensual > $200
 
 ---
 
 ## Preguntas frecuentes
 
-**¿Por qué Postgres y Neo4j en lugar de solo uno?**
-Postgres con pgvector es excelente para búsqueda semántica pero no modela relaciones entre entidades. Neo4j/Graphiti es excelente para razonar sobre relaciones ("¿quién invirtió en qué empresa?", "¿qué personas comparten metodologías?") pero más lento y costoso. La arquitectura híbrida toma lo mejor de cada uno.
+**¿Por qué el chunk_size es 800 y no 1000?**
+Chunks más pequeños producen recuperación más precisa (retorna solo la sección relevante, no párrafos enteros). El ahorro en tokens de contexto en generación supera el leve aumento en costos de embedding de ingesta (que ocurre una sola vez).
 
-**¿Qué es Graphiti exactamente?**
-`graphiti-core` es una librería open source que toma texto libre y automáticamente extrae entidades (personas, empresas, conceptos) y las relaciones entre ellas, guardándolas como nodos y aristas en Neo4j. Internamente llama al LLM configurado (OpenAI o Gemini) con varios prompts encadenados.
+**¿Por qué el overlap es 100 y no 200?**
+El overlap existe para evitar que ideas queden cortadas sin contexto. Pero cada carácter de overlap se embeddea dos veces (en el chunk anterior y en el siguiente). Con overlap=100 sobre chunk_size=800, solo el 12.5% de los tokens se duplican (antes: 20%). La calidad de recuperación no cambia materialmente para textos conversacionales.
 
-**¿Por qué se pre-calculan los metadatos en Fase 1 si Graphiti los va a extraer igual en Fase 2?**
-Porque el `source_description` que se le pasa a `add_episode()` guía el LLM de Graphiti. Sin él, Graphiti necesita inferir el tipo de documento, sus participantes y sus temas desde cero — lo que consume prompts completos. Con el contexto pre-calculado, el LLM puede enfocarse directamente en extraer relaciones en lugar de descubrir información que ya tenemos. El ahorro estimado es 20–30% en tokens por episodio.
+**¿Por qué se trunca el texto antes de enviarlo a Graphiti?**
+Graphiti realiza ~30 llamadas LLM internas por episodio, y cada una recibe el texto completo como contexto. Las entidades clave de un documento típico siempre están en las primeras 6.000 caracteres. Truncar a ese límite reduce ~60% del costo de Graphiti sin impactar la calidad del grafo.
 
-**¿Qué pasa si la hidratación se corta a mitad?**
-`hydrate_graph.py` es reanudable. Cada documento procesado exitosamente recibe el flag `metadata->>'graph_ingested': true` en Postgres. La próxima ejecución consulta solo los documentos sin ese flag usando el índice parcial, así que no reprocesa nada.
+**¿Por qué `gpt-5-mini` necesita `max_completion_tokens = 8192`?**
+`gpt-5-mini` pertenece a la familia de modelos de razonamiento (`o1`). Antes de producir output visible, consume *reasoning tokens* de forma interna. Con el límite por defecto de 2048 tokens, el modelo usa todos los tokens en razonamiento y no le queda espacio para generar el JSON estructurado que Graphiti necesita. Aumentar el límite a 8192 da el espacio necesario; los tokens no usados no se cobran.
 
-**¿Cómo agrego más documentos?**
-Ponelos en `documents_to_index/` y corrés el pipeline de nuevo. La deduplicación por hash SHA-256 garantiza que los documentos que ya están procesados no se vuelven a ingestar.
-
-**¿Puedo usar solo Gemini?**
-Sí. En el `.env` poner `LLM_PROVIDER=gemini` y `GEMINI_API_KEY=...`. El sistema automáticamente usa `gemini-1.5-flash` para el LLM y `text-embedding-004` (768 dimensiones) para embeddings. El schema se ajusta al ejecutar `init_db()`.
-
-**¿Cómo corro los tests?**
-```bash
-pytest tests/poc/
-```
-Hay tests para `TokenTracker` (thread-safety, acumulación de costos) y `CostCalculator` (precios por modelo).
+**¿Por qué la hidratación es secuencial y no paralela?**
+`add_episode()` dispara internamente ~30 llamadas LLM en paralelo. Si se procesan 2-3 episodios simultáneos, se multiplican las llamadas paralelas por 2-3, agotando el límite de tokens por minuto (TPM) en segundos. El procesamiento secuencial con un delay de 5 segundos entre episodios permite que la ventana de TPM se renueve parcialmente y elimina los errores 429.

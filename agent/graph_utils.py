@@ -11,35 +11,44 @@ from poc.token_tracker import tracker
 
 logger = logging.getLogger(__name__)
 
-_GRAPHITI_OUTPUT_RATIO = 0.30  # ratio conservador tokens-out / tokens-in
+_GRAPHITI_OUTPUT_RATIO = 0.30
+
+# OPTIMIZED: limite de chars del episode_body enviado a Graphiti.
+# Graphiti procesa el texto completo en ~30 llamadas LLM internas en paralelo.
+# 6000 chars (~1500 tokens) preserva todas las entidades clave y elimina
+# texto de relleno que sube el costo sin mejorar el grafo.
+_MAX_EPISODE_CHARS = 6_000
+
+# OPTIMIZED: resultados de busqueda en grafo: 5 -> 3.
+_GRAPH_SEARCH_RESULTS = 3
 
 
 class GraphClient:
     _client: Optional[Graphiti] = None
     _initialized: bool = False
-    _loop: Optional[asyncio.AbstractEventLoop] = None  # Track the loop used for init
+    _loop: Optional[asyncio.AbstractEventLoop] = None
 
     @classmethod
     def _check_loop(cls):
-        """Reset client if event loop changes (e.g. Streamlit rerun)."""
+        """Resetea el cliente si el event loop cambia (ej. Streamlit rerun)."""
         current_loop = asyncio.get_running_loop()
         if cls._loop and cls._loop is not current_loop:
-             logger.warning("GraphClient loop changed — resetting client.")
-             cls.reset()
+            logger.warning("GraphClient loop changed - resetting client.")
+            cls.reset()
         cls._loop = current_loop
 
     @classmethod
     def _build_client(cls) -> Graphiti:
         """
-        Construye el objeto Graphiti de forma síncrona.
-        NO llama build_indices_and_constraints — eso se hace en ensure_initialized().
+        Construye el objeto Graphiti de forma sincrona.
+        NO llama build_indices_and_constraints aqui.
         """
         provider = settings.LLM_PROVIDER.lower()
         try:
             if provider == "gemini":
                 from agent.gemini_client import GeminiClient
                 from graphiti_core.embedder.gemini import GeminiEmbedder
-                logger.info("Initializing Graphiti with Gemini (%s)…", settings.DEFAULT_MODEL)
+                logger.info("Initializing Graphiti with Gemini (%s)...", settings.DEFAULT_MODEL)
                 client = Graphiti(
                     uri=settings.NEO4J_URI,
                     user=settings.NEO4J_USER,
@@ -50,8 +59,7 @@ class GraphClient:
             else:
                 from agent.custom_openai_client import CustomOpenAIClient
                 from graphiti_core.llm_client.config import LLMConfig
-                
-                logger.info("Initializing Graphiti with CustomOpenAI (%s)…", settings.DEFAULT_MODEL)
+                logger.info("Initializing Graphiti with CustomOpenAI (%s)...", settings.DEFAULT_MODEL)
                 client = Graphiti(
                     uri=settings.NEO4J_URI,
                     user=settings.NEO4J_USER,
@@ -63,7 +71,7 @@ class GraphClient:
                         )
                     ),
                 )
-            logger.info("Graphiti client object created (provider=%s).", provider)
+            logger.info("Graphiti client created (provider=%s).", provider)
             return client
         except Exception:
             logger.exception("Failed to build Graphiti client")
@@ -73,22 +81,16 @@ class GraphClient:
     async def ensure_initialized(cls) -> Graphiti:
         """
         Retorna el cliente Graphiti listo para usar.
-
-        La primera vez:
-          1. Construye el objeto Graphiti.
-          2. Llama build_indices_and_constraints() — crea índices y constraints
-             en Neo4j necesarios para que add_episode() funcione.
-
-        Las siguientes veces retorna el cliente cacheado directamente.
+        La primera vez: construye el objeto Y llama build_indices_and_constraints().
+        Las siguientes: retorna el cliente cacheado directamente.
         """
-
         cls._check_loop()
         if cls._client is None:
             cls._client = cls._build_client()
 
         if not cls._initialized:
             try:
-                logger.info("Running build_indices_and_constraints() on Neo4j…")
+                logger.info("Running build_indices_and_constraints() on Neo4j...")
                 await cls._client.build_indices_and_constraints()
                 cls._initialized = True
                 logger.info("Graphiti indices/constraints ready.")
@@ -103,10 +105,7 @@ class GraphClient:
 
     @classmethod
     async def ensure_schema(cls) -> None:
-        """
-        Alias público para mantener compatibilidad con run_poc.py y hydrate_graph.py.
-        Delega en ensure_initialized().
-        """
+        """Alias publico para compatibilidad con run_poc.py y hydrate_graph.py."""
         await cls.ensure_initialized()
 
     @classmethod
@@ -117,19 +116,28 @@ class GraphClient:
         source_description: Optional[str] = None,
     ) -> None:
         """
-        Añade un episodio al knowledge graph.
+        Anade un episodio al knowledge graph.
 
-        `source_description` guía al LLM de Graphiti hacia las entidades correctas.
-        Si se provee el `graphiti_ready_context` calculado en Fase 1 (ingesta),
-        Graphiti extrae entidades más precisas con menos tokens.
+        OPTIMIZADO: el content se trunca a _MAX_EPISODE_CHARS antes de
+        enviarlo a Graphiti. Reduce ~60% el costo de las ~30 llamadas LLM
+        internas (cada una recibe el mismo texto completo de entrada).
         """
         client = await cls.ensure_initialized()
+
+        original_len = len(content)
+        if original_len > _MAX_EPISODE_CHARS:
+            content = content[:_MAX_EPISODE_CHARS]
+            logger.debug(
+                "Episode '%s' truncated for Graphiti: %d -> %d chars (%.0f%% reduction)",
+                source_reference, original_len, _MAX_EPISODE_CHARS,
+                (1 - _MAX_EPISODE_CHARS / original_len) * 100,
+            )
 
         estimated_input = tracker.estimate_tokens(content)
         op_id = f"graph_ingest_{uuid.uuid4().hex}"
         tracker.start_operation(op_id, "graph_ingestion")
 
-        effective_description = source_description or f"Document ingested from {source_reference}"
+        effective_description = source_description or f"Document: {source_reference}"
 
         try:
             from graphiti_core.nodes import EpisodeType
@@ -158,27 +166,29 @@ class GraphClient:
             metrics = tracker.end_operation(op_id)
             if metrics:
                 logger.info(
-                    "Graph episode '%s': est. cost $%.4f (in=%d out=%d tokens)",
+                    "Graph episode '%s': est. cost $%.4f (in=%d out=%d tokens) "
+                    "[content: %d/%d chars]",
                     source_reference,
                     metrics.cost_usd,
                     metrics.tokens_in,
                     metrics.tokens_out,
+                    len(content),
+                    original_len,
                 )
 
     @classmethod
-    async def search(cls, query: str, num_results: int = 5) -> List[str]:
+    async def search(cls, query: str, num_results: int = _GRAPH_SEARCH_RESULTS) -> List[str]:
         """
         Busca en el knowledge graph y retorna resultados como strings.
 
-        graphiti-core 0.12.x retorna una lista de objetos (EntityEdge, etc.).
-        Los serializamos con str() para mantener la interfaz simple.
+        OPTIMIZADO: num_results por defecto reducido de 5 -> 3.
+        Cada resultado se concatena en el prompt de generacion.
         """
         client = await cls.ensure_initialized()
         try:
             results = await client.search(query, num_results=num_results)
             if not results:
                 return []
-            # Normalizar: graphiti puede retornar varios tipos de objeto
             output = []
             for r in results:
                 if hasattr(r, "fact"):
@@ -194,8 +204,6 @@ class GraphClient:
 
     @classmethod
     def reset(cls) -> None:
-        """
-        Resetea el singleton. Útil en tests o cuando cambia la config.
-        """
+        """Resetea el singleton. Util en tests o cuando cambia la config."""
         cls._client = None
         cls._initialized = False

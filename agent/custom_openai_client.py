@@ -1,19 +1,54 @@
-import typing
-from pydantic import BaseModel
-from openai.types.chat import ChatCompletionMessageParam
-import openai
-from graphiti_core.llm_client.openai_client import OpenAIClient, ModelSize, DEFAULT_MODEL, DEFAULT_SMALL_MODEL, DEFAULT_MAX_TOKENS
-from graphiti_core.prompts.models import Message
-from graphiti_core.llm_client.errors import RateLimitError, RefusalError
+import asyncio
 import logging
+import typing
+
+import openai
+from openai.types.chat import ChatCompletionMessageParam
+from pydantic import BaseModel
+
+from graphiti_core.llm_client.config import LLMConfig
+from graphiti_core.llm_client.errors import RateLimitError, RefusalError
+from graphiti_core.llm_client.openai_client import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MODEL,
+    DEFAULT_SMALL_MODEL,
+    ModelSize,
+    OpenAIClient,
+)
+from graphiti_core.prompts.models import Message
 
 logger = logging.getLogger(__name__)
 
+_MAX_RATE_LIMIT_RETRIES = 5
+_RETRY_BASE_SECONDS = 10
+
+# FIX BUG 2 (iteracion 3): 16384 para cubrir reasoning + JSON output.
+# Los prompts de graphiti-core llegan a ~20k tokens.
+# El reasoning consume 8000-12000 tokens en esos casos.
+# El JSON de output necesita ~300-500 tokens adicionales.
+# Total worst-case: ~12500 -> 16384 da margen seguro.
+_MAX_TOKENS_REASONING_MODELS = 16384
+
+
 class CustomOpenAIClient(OpenAIClient):
     """
-    Subclass of OpenAIClient to support models that require `max_completion_tokens`
-    instead of `max_tokens` (e.g., o1-preview, o1-mini, gpt-5-mini).
+    Subclass de OpenAIClient para modelos gpt-5-* y o1-*.
+
+    1. max_completion_tokens=16384 para cubrir reasoning interno.
+    2. small_model = medium_model (evita gpt-4.1-nano con limite 200k TPM).
+    3. Retry con backoff ante 429.
     """
+
+    def __init__(self, config: LLMConfig) -> None:
+        super().__init__(config)
+
+        original_small = self.small_model or DEFAULT_SMALL_MODEL
+        if self.model and self.model != original_small:
+            logger.info(
+                "CustomOpenAIClient: overriding small_model '%s' -> '%s'",
+                original_small, self.model,
+            )
+            self.small_model = self.model
 
     async def _generate_response(
         self,
@@ -22,57 +57,80 @@ class CustomOpenAIClient(OpenAIClient):
         max_tokens: int = DEFAULT_MAX_TOKENS,
         model_size: ModelSize = ModelSize.medium,
     ) -> dict[str, typing.Any]:
+
+        if model_size == ModelSize.small:
+            model = self.small_model or DEFAULT_SMALL_MODEL
+        else:
+            model = self.model or DEFAULT_MODEL
+
         openai_messages: list[ChatCompletionMessageParam] = []
         for m in messages:
             m.content = self._clean_input(m.content)
-            if m.role == 'user':
-                openai_messages.append({'role': 'user', 'content': m.content})
-            elif m.role == 'system':
-                openai_messages.append({'role': 'system', 'content': m.content})
-        try:
-            if model_size == ModelSize.small:
-                model = self.small_model or DEFAULT_SMALL_MODEL
-            else:
-                model = self.model or DEFAULT_MODEL
+            if m.role == "user":
+                openai_messages.append({"role": "user", "content": m.content})
+            elif m.role == "system":
+                openai_messages.append({"role": "system", "content": m.content})
 
-            # --- CUSTOM LOGIC START ---
-            # Check if using a model that likely requires max_completion_tokens
-            # For this POC, we assume any model starting with 'o1-' or 'gpt-5' needs this.
-            use_completion_tokens = model.startswith("o1-") or model.startswith("gpt-5")
-            
-            kwargs = {
-                "model": model,
-                "messages": openai_messages,
-                # "temperature": self.temperature, # O-series models often don't support temp, but let's keep it unless it errors
-                "response_format": response_model,
-            }
+        # gpt-5-* y o1-* son reasoning models:
+        # - usan max_completion_tokens (no max_tokens)
+        # - no aceptan temperature
+        # - consumen reasoning_tokens antes de generar output visible
+        is_reasoning_model = model.startswith("o1-") or model.startswith("gpt-5")
 
-            # Some models don't support temperature (e.g. o1-preview, gpt-5-mini)
-            if not model.startswith("o1-") and not model.startswith("gpt-5"):
-                 kwargs["temperature"] = self.temperature
+        if is_reasoning_model:
+            effective_max_tokens = _MAX_TOKENS_REASONING_MODELS
+        else:
+            effective_max_tokens = max_tokens or self.max_tokens or DEFAULT_MAX_TOKENS
 
-            if use_completion_tokens:
-                 # Rename parameter
-                 kwargs["max_completion_tokens"] = max_tokens or self.max_tokens
-            else:
-                 kwargs["max_tokens"] = max_tokens or self.max_tokens
-            
-            # --- CUSTOM LOGIC END ---
+        kwargs: dict[str, typing.Any] = {
+            "model": model,
+            "messages": openai_messages,
+            "response_format": response_model,
+        }
 
-            response = await self.client.beta.chat.completions.parse(**kwargs)
+        if not is_reasoning_model:
+            kwargs["temperature"] = self.temperature
 
-            response_object = response.choices[0].message
+        if is_reasoning_model:
+            kwargs["max_completion_tokens"] = effective_max_tokens
+        else:
+            kwargs["max_tokens"] = effective_max_tokens
 
-            if response_object.parsed:
-                return response_object.parsed.model_dump()
-            elif response_object.refusal:
-                raise RefusalError(response_object.refusal)
-            else:
-                raise Exception(f'Invalid response from LLM: {response_object.model_dump()}')
-        except openai.LengthFinishReasonError as e:
-            raise Exception(f'Output length exceeded max tokens {self.max_tokens}: {e}') from e
-        except openai.RateLimitError as e:
-            raise RateLimitError from e
-        except Exception as e:
-            logger.error(f'Error in generating LLM response: {e}')
-            raise
+        last_error: Exception | None = None
+        for attempt in range(_MAX_RATE_LIMIT_RETRIES):
+            try:
+                response = await self.client.beta.chat.completions.parse(**kwargs)
+                response_object = response.choices[0].message
+
+                if response_object.parsed:
+                    return response_object.parsed.model_dump()
+                elif response_object.refusal:
+                    raise RefusalError(response_object.refusal)
+                else:
+                    raise Exception(
+                        f"Invalid response from LLM: {response_object.model_dump()}"
+                    )
+
+            except openai.LengthFinishReasonError as e:
+                raise Exception(f"Output length exceeded: {e}") from e
+
+            except openai.RateLimitError as e:
+                last_error = e
+                wait = _RETRY_BASE_SECONDS * (2 ** attempt)
+                if attempt < _MAX_RATE_LIMIT_RETRIES - 1:
+                    logger.warning(
+                        "Rate limit on '%s' (attempt %d/%d). Waiting %ds...",
+                        model, attempt + 1, _MAX_RATE_LIMIT_RETRIES, wait,
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        "Rate limit persists after %d attempts.", _MAX_RATE_LIMIT_RETRIES
+                    )
+                    raise RateLimitError from e
+
+            except Exception as e:
+                logger.error("LLM response error: %s", e)
+                raise
+
+        raise RateLimitError from last_error

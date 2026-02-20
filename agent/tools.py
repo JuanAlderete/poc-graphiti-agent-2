@@ -13,13 +13,11 @@ from poc.token_tracker import tracker
 
 logger = logging.getLogger(__name__)
 
+# OPTIMIZED: reducido de 5 -> 3
+_DEFAULT_SEARCH_LIMIT = 3
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _parse_metadata(raw: Any) -> Dict[str, Any]:
-    """Normalise metadata coming from the DB (may be str-encoded JSON or dict)."""
     if isinstance(raw, str):
         try:
             return json.loads(raw)
@@ -29,48 +27,34 @@ def _parse_metadata(raw: Any) -> Dict[str, Any]:
 
 
 def _log_search(
-    op_id: str,
-    start_time: float,
-    query: str,
-    search_type: str,
-    embed_tokens: int,
-    llm_in: int,
-    llm_out: int,
-    embed_cost: float,
-    llm_cost: float,
-    result_count: int,
-    latency_ms: float,
+    op_id: str, start_time: float, query: str, search_type: str,
+    embed_tokens: int, llm_in: int, llm_out: int,
+    embed_cost: float, llm_cost: float, result_count: int, latency_ms: float,
 ) -> None:
-    search_logger.log_row(
-        {
-            "query_id": op_id,
-            "timestamp": start_time,
-            "query_texto": query,
-            "longitud_query": len(query),
-            "tipo_busqueda": search_type,
-            "tokens_embedding": embed_tokens,
-            "tokens_llm_in": llm_in,
-            "tokens_llm_out": llm_out,
-            "costo_embedding_usd": embed_cost,
-            "costo_llm_usd": llm_cost,
-            "costo_total_usd": embed_cost + llm_cost,
-            "resultados_retornados": result_count,
-            "latencia_ms": latency_ms,
-        }
-    )
+    search_logger.log_row({
+        "query_id": op_id,
+        "timestamp": start_time,
+        "query_texto": query,
+        "longitud_query": len(query),
+        "tipo_busqueda": search_type,
+        "tokens_embedding": embed_tokens,
+        "tokens_llm_in": llm_in,
+        "tokens_llm_out": llm_out,
+        "costo_embedding_usd": embed_cost,
+        "costo_llm_usd": llm_cost,
+        "costo_total_usd": embed_cost + llm_cost,
+        "resultados_retornados": result_count,
+        "latencia_ms": latency_ms,
+    })
 
 
-# ---------------------------------------------------------------------------
-# Tool implementations
-# ---------------------------------------------------------------------------
-
-async def vector_search_tool(query: str, limit: int = 5) -> List[SearchResult]:
-    """Vector similarity search against Postgres chunks."""
+async def vector_search_tool(query: str, limit: int = _DEFAULT_SEARCH_LIMIT) -> List[SearchResult]:
+    """Busqueda por similitud vectorial contra chunks en Postgres."""
     start_time = time.time()
     op_id = f"search_vector_{start_time:.3f}"
     tracker.start_operation(op_id, "vector_search")
 
-    embedder = get_embedder()  # FIXED: singleton, not new instance per call
+    embedder = get_embedder()
     embedding, embed_tokens = await embedder.generate_embedding(query)
     tracker.record_usage(op_id, embed_tokens, 0, settings.EMBEDDING_MODEL, "embedding")
 
@@ -94,15 +78,13 @@ async def vector_search_tool(query: str, limit: int = 5) -> List[SearchResult]:
 
 
 async def graph_search_tool(query: str) -> List[SearchResult]:
-    """Graph search via Graphiti / Neo4j."""
+    """Busqueda en grafo via Graphiti / Neo4j."""
     start_time = time.time()
     op_id = f"search_graph_{start_time:.3f}"
     tracker.start_operation(op_id, "graph_search")
 
     tokens_in = tracker.estimate_tokens(query)
-
     results_text = await GraphClient.search(query)
-
     tokens_out = sum(tracker.estimate_tokens(t) for t in results_text)
     tracker.record_usage(op_id, tokens_in, tokens_out, settings.DEFAULT_MODEL, "graph_search_llm")
 
@@ -115,13 +97,13 @@ async def graph_search_tool(query: str) -> List[SearchResult]:
     return [SearchResult(content=t, source="graphiti") for t in results_text]
 
 
-async def hybrid_search_tool(query: str, limit: int = 5) -> List[SearchResult]:
-    """Hybrid RRF search: vector + full-text via Postgres stored procedure."""
+async def hybrid_search_tool(query: str, limit: int = _DEFAULT_SEARCH_LIMIT) -> List[SearchResult]:
+    """Busqueda hibrida RRF: vector + full-text via Postgres."""
     start_time = time.time()
     op_id = f"search_hybrid_{start_time:.3f}"
     tracker.start_operation(op_id, "hybrid_search")
 
-    embedder = get_embedder()  # FIXED: singleton
+    embedder = get_embedder()
     embedding, embed_tokens = await embedder.generate_embedding(query)
     tracker.record_usage(op_id, embed_tokens, 0, settings.EMBEDDING_MODEL, "embedding")
 
