@@ -205,4 +205,4 @@ secrets/
 *.json
 *.yml
 *.yaml
-repomix-output.xml
+repomix-output.*
