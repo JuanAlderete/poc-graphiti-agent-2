@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Pool management
+# Pool
 # ---------------------------------------------------------------------------
 
 class DatabasePool:
@@ -22,13 +22,9 @@ class DatabasePool:
     @classmethod
     async def get_pool(cls) -> asyncpg.Pool:
         current_loop = asyncio.get_running_loop()
-
         if cls._pool is not None:
-            loop_changed = cls._loop is not current_loop
-            loop_closed = cls._loop is None or cls._loop.is_closed()
-            if loop_changed or loop_closed:
-                logger.warning("Event loop changed or closed — resetting DB pool.")
-                # Attempt a clean close; ignore errors (old loop may be gone)
+            if cls._loop is not current_loop or (cls._loop and cls._loop.is_closed()):
+                logger.warning("Event loop changed — resetting DB pool.")
                 try:
                     await cls._pool.close()
                 except Exception:
@@ -37,22 +33,18 @@ class DatabasePool:
                 cls._loop = None
 
         if cls._pool is None:
-            try:
-                cls._pool = await asyncpg.create_pool(
-                    user=settings.POSTGRES_USER,
-                    password=settings.POSTGRES_PASSWORD,
-                    database=settings.POSTGRES_DB,
-                    host=settings.POSTGRES_HOST,
-                    port=settings.POSTGRES_PORT,
-                    min_size=2,
-                    max_size=10,
-                    command_timeout=30,
-                )
-                cls._loop = current_loop
-                logger.info("Database connection pool created (min=2, max=10).")
-            except Exception:
-                logger.exception("Failed to create database pool")
-                raise
+            cls._pool = await asyncpg.create_pool(
+                user=settings.POSTGRES_USER,
+                password=settings.POSTGRES_PASSWORD,
+                database=settings.POSTGRES_DB,
+                host=settings.POSTGRES_HOST,
+                port=settings.POSTGRES_PORT,
+                min_size=2,
+                max_size=10,
+                command_timeout=30,
+            )
+            cls._loop = current_loop
+            logger.info("DB pool created (min=2, max=10).")
 
         return cls._pool  # type: ignore[return-value]
 
@@ -65,53 +57,34 @@ class DatabasePool:
 
     @classmethod
     async def clear_database(cls) -> None:
-        """Truncates documents and chunks tables (CASCADE)."""
         pool = await cls.get_pool()
         async with pool.acquire() as conn:
             await conn.execute("TRUNCATE TABLE chunks, documents CASCADE;")
-            logger.info("Cleared Postgres tables: documents, chunks.")
+            logger.info("Cleared documents + chunks.")
 
     @classmethod
     async def init_db(cls) -> None:
-        """
-        Ensures required extensions exist and applies schema.sql if the
-        chunks table is missing.
-        """
         pool = await cls.get_pool()
         async with pool.acquire() as conn:
-            # Extensions
             for ext in ("vector", "uuid-ossp", "pg_trgm"):
                 await conn.execute(f'CREATE EXTENSION IF NOT EXISTS "{ext}";')
-            logger.info("Database extensions ensured.")
 
-            # Determine vector dimension
             expected_dim = 768 if (
                 "gemini" in settings.LLM_PROVIDER.lower()
                 or "004" in settings.EMBEDDING_MODEL
             ) else 1536
-            logger.info("Expected embedding dimension: %d", expected_dim)
 
             table_exists = await conn.fetchval(
-                """
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = 'public' AND table_name = 'chunks'
-                )
-                """
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema='public' AND table_name='chunks')"
             )
-
             if not table_exists:
-                try:
-                    with open("sql/schema.sql", encoding="utf-8") as fh:
-                        schema_sql = fh.read()
-                    if expected_dim != 1536:
-                        schema_sql = schema_sql.replace("vector(1536)", f"vector({expected_dim})")
-                        logger.info("Adjusted schema to vector(%d)", expected_dim)
-                    await conn.execute(schema_sql)
-                    logger.info("Database schema applied from sql/schema.sql.")
-                except Exception:
-                    logger.exception("Failed to apply schema")
-                    raise
+                with open("sql/schema.sql", encoding="utf-8") as fh:
+                    sql = fh.read()
+                if expected_dim != 1536:
+                    sql = sql.replace("vector(1536)", f"vector({expected_dim})")
+                await conn.execute(sql)
+                logger.info("Schema applied (dim=%d).", expected_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +99,25 @@ async def get_db_connection():
 
 
 def _fmt_vec(embedding: List[float]) -> str:
-    """Convert a Python float list to the pgvector literal format '[1.0,2.0,...]'."""
     return "[" + ",".join(str(v) for v in embedding) + "]"
+
+
+# ---------------------------------------------------------------------------
+# Deduplicación
+# ---------------------------------------------------------------------------
+
+async def document_exists_by_hash(content_hash: str) -> bool:
+    """
+    Retorna True si ya existe un documento con ese hash de contenido.
+    Usa el campo metadata->>'content_hash' guardado en ingesta.
+    Evita re-ingestar el mismo archivo al re-ejecutar el script.
+    """
+    async with get_db_connection() as conn:
+        exists = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM documents WHERE metadata->>'content_hash' = $1)",
+            content_hash,
+        )
+        return bool(exists)
 
 
 # ---------------------------------------------------------------------------
@@ -140,18 +130,11 @@ async def insert_document(
     content: str,
     metadata: dict | None = None,
 ) -> str:
-    """Inserts a document record and returns its UUID as a string."""
     async with get_db_connection() as conn:
         doc_id = await conn.fetchval(
-            """
-            INSERT INTO documents (title, source, content, metadata)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id
-            """,
-            title,
-            source,
-            content,
-            json.dumps(metadata or {}),
+            "INSERT INTO documents (title, source, content, metadata) "
+            "VALUES ($1, $2, $3, $4) RETURNING id",
+            title, source, content, json.dumps(metadata or {}),
         )
         return str(doc_id)
 
@@ -161,30 +144,119 @@ async def insert_chunks(
     chunks: List[str],
     embeddings: List[List[float]],
     start_index: int = 0,
+    chunk_metas: List[Dict[str, Any]] | None = None,
 ) -> None:
     """
-    Inserts chunks with their embeddings for a given document.
-
-    FIXED: uses _fmt_vec() consistently and passes metadata as a JSON string
-    rather than json.dumps({}) inside a tuple (minor but cleaner).
+    Inserta chunks con embeddings.
+    `chunk_metas`: lista de dicts (uno por chunk) con metadata enriquecida.
+    Si se omite, cada chunk lleva metadata vacía.
     """
+    metas = chunk_metas or [{}] * len(chunks)
     async with get_db_connection() as conn:
-        chunk_data = [
+        data = [
             (
                 doc_id,
                 chunk_text,
                 _fmt_vec(embedding),
                 start_index + i,
-                "{}",  # metadata JSONB — empty object literal
+                json.dumps(metas[i] if i < len(metas) else {}),
             )
             for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings))
         ]
         await conn.executemany(
+            "INSERT INTO chunks (document_id, content, embedding, chunk_index, metadata) "
+            "VALUES ($1::uuid, $2, $3::vector, $4, $5::jsonb)",
+            data,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Read helpers para hydrate_graph.py
+# ---------------------------------------------------------------------------
+
+async def get_all_documents(
+    limit: int = 1000,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Devuelve todos los documentos de Postgres para hydrate_graph.py.
+    Incluye metadata (JSONB parseado) — contiene detected_people,
+    detected_companies y graphiti_ready_context pre-calculados.
+
+    Soporta paginación para datasets grandes.
+    """
+    async with get_db_connection() as conn:
+        rows = await conn.fetch(
             """
-            INSERT INTO chunks (document_id, content, embedding, chunk_index, metadata)
-            VALUES ($1::uuid, $2, $3::vector, $4, $5::jsonb)
+            SELECT id, title, source, content, metadata, created_at
+            FROM documents
+            ORDER BY created_at ASC
+            LIMIT $1 OFFSET $2
             """,
-            chunk_data,
+            limit, offset,
+        )
+        result = []
+        for row in rows:
+            d = dict(row)
+            # Normaliza metadata: puede venir como str o dict
+            raw_meta = d.get("metadata", {})
+            if isinstance(raw_meta, str):
+                try:
+                    d["metadata"] = json.loads(raw_meta)
+                except Exception:
+                    d["metadata"] = {}
+            d["id"] = str(d["id"])
+            result.append(d)
+        return result
+
+
+async def get_documents_missing_from_graph(limit: int = 500) -> List[Dict[str, Any]]:
+    """
+    Retorna documentos que NO han sido hidratados al grafo todavía.
+    Usa el flag metadata->>'graph_ingested' para llevar el control.
+
+    hydrate_graph.py puede llamar a esta función para reanudar una
+    hidratación interrumpida sin reprocesar todo.
+    """
+    async with get_db_connection() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, title, source, content, metadata
+            FROM documents
+            WHERE (metadata->>'graph_ingested')::boolean IS NOT TRUE
+            ORDER BY created_at ASC
+            LIMIT $1
+            """,
+            limit,
+        )
+        result = []
+        for row in rows:
+            d = dict(row)
+            raw_meta = d.get("metadata", {})
+            if isinstance(raw_meta, str):
+                try:
+                    d["metadata"] = json.loads(raw_meta)
+                except Exception:
+                    d["metadata"] = {}
+            d["id"] = str(d["id"])
+            result.append(d)
+        return result
+
+
+async def mark_document_graph_ingested(doc_id: str) -> None:
+    """
+    Marca un documento como ya hidratado en el grafo.
+    Permite reanudar hydrate_graph.py sin reprocesar docs ya hechos.
+    """
+    async with get_db_connection() as conn:
+        await conn.execute(
+            """
+            UPDATE documents
+            SET metadata = metadata || '{"graph_ingested": true}'::jsonb,
+                updated_at = NOW()
+            WHERE id = $1::uuid
+            """,
+            doc_id,
         )
 
 
@@ -196,7 +268,6 @@ async def vector_search(
     embedding: List[float],
     limit: int = 5,
 ) -> List[Dict[str, Any]]:
-    """Cosine-similarity vector search against the chunks table."""
     limit = max(1, limit)
     async with get_db_connection() as conn:
         rows = await conn.fetch(
@@ -213,8 +284,7 @@ async def vector_search(
             ORDER BY c.embedding <=> $1::vector
             LIMIT $2
             """,
-            _fmt_vec(embedding),
-            limit,
+            _fmt_vec(embedding), limit,
         )
         return [dict(row) for row in rows]
 
@@ -224,20 +294,10 @@ async def hybrid_search(
     embedding: List[float],
     limit: int = 5,
 ) -> List[Dict[str, Any]]:
-    """Hybrid RRF search using the stored procedure defined in schema.sql."""
     limit = max(1, limit)
     async with get_db_connection() as conn:
         rows = await conn.fetch(
             "SELECT * FROM hybrid_search($1::vector, $2, $3)",
-            _fmt_vec(embedding),
-            text_query,
-            limit,
+            _fmt_vec(embedding), text_query, limit,
         )
-        return [dict(row) for row in rows]
-
-
-async def get_all_documents() -> List[Dict[str, Any]]:
-    """Fetches all documents (id, title, source, content, metadata) from the DB."""
-    async with get_db_connection() as conn:
-        rows = await conn.fetch("SELECT id, title, source, content, metadata FROM documents")
         return [dict(row) for row in rows]
