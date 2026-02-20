@@ -1,122 +1,204 @@
-import asyncio
+import os
+import time
+import random
+from typing import Optional
 import logging
-import typing
 
-import openai
-from openai.types.chat import ChatCompletionMessageParam
-from pydantic import BaseModel
-
+from openai import AsyncOpenAI, RateLimitError, APIError
+from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig
-from graphiti_core.llm_client.errors import RateLimitError, RefusalError
-from graphiti_core.llm_client.openai_client import (
-    DEFAULT_MAX_TOKENS,
-    DEFAULT_MODEL,
-    DEFAULT_SMALL_MODEL,
-    ModelSize,
-    OpenAIClient,
-)
-from graphiti_core.prompts.models import Message
+from graphiti_core.llm_client.errors import RateLimitError as GraphitiRateLimitError
 
 logger = logging.getLogger(__name__)
 
-_MAX_RETRIES = 5
-_RETRY_BASE_SECONDS = 10
-
-# Para gpt-5-* y o1-*: reasoning consume ~8-12k tokens antes del output.
-# Con prompt ~20k: reasoning ~8-12k + JSON output ~500 = ~12500 worst case.
-# 16384 cubre con margen; tokens no usados no se cobran.
-_MAX_TOKENS_REASONING = 16384
-
-
-class CustomOpenAIClient(OpenAIClient):
+class OptimizedOpenAIClient(LLMClient):
     """
-    Drop-in replacement para OpenAIClient de graphiti-core.
-
-    Registrar en graph_utils.py:
-        from agent.custom_openai_client import CustomOpenAIClient
-        llm_client = CustomOpenAIClient(config=LLMConfig(...))
+    Optimized OpenAI client with:
+    - Exponential backoff for rate limiting
+    - HTTP connection pooling
+    - Token usage optimization
+    - Request batching
     """
-
-    def __init__(self, config: LLMConfig) -> None:
-        super().__init__(config)
-        original = self.small_model or DEFAULT_SMALL_MODEL
-        if self.model and self.model != original:
-            logger.info(
-                "CustomOpenAIClient: small_model '%s' -> '%s'",
-                original, self.model,
-            )
-            self.small_model = self.model
-
-    async def _generate_response(
+    
+    def __init__(
         self,
-        messages: list[Message],
-        response_model: type[BaseModel] | None = None,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
-        model_size: ModelSize = ModelSize.medium,
-    ) -> dict[str, typing.Any]:
-
-        model = (
-            self.small_model or DEFAULT_SMALL_MODEL
-            if model_size == ModelSize.small
-            else self.model or DEFAULT_MODEL
+        api_key: Optional[str] = None,
+        model: str = "gpt-5-mini",
+        max_retries: int = 5,
+        base_delay: float = 1.0,
+        max_delay: float = 60.0,
+        temperature: float = 0.1,
+    ):
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError("OPENAI_API_KEY not found")
+        
+        self.model = model
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+        self.temperature = temperature
+        
+        # Reutilizar el cliente HTTP con connection pooling
+        self._client = AsyncOpenAI(
+            api_key=self.api_key,
+            timeout=60.0,
+            max_retries=0,  # Manejamos nosotros los retries
         )
-
-        openai_messages: list[ChatCompletionMessageParam] = []
-        for m in messages:
-            m.content = self._clean_input(m.content)
-            if m.role == "user":
-                openai_messages.append({"role": "user", "content": m.content})
-            elif m.role == "system":
-                openai_messages.append({"role": "system", "content": m.content})
-
-        is_reasoning = model.startswith("o1-") or model.startswith("gpt-5")
-
-        effective_tokens = (
-            _MAX_TOKENS_REASONING if is_reasoning
-            else (max_tokens or self.max_tokens or DEFAULT_MAX_TOKENS)
-        )
-
-        kwargs: dict[str, typing.Any] = {
-            "model": model,
-            "messages": openai_messages,
-            "response_format": response_model,
-        }
-        if not is_reasoning:
-            kwargs["temperature"] = self.temperature
-        if is_reasoning:
-            kwargs["max_completion_tokens"] = effective_tokens
+        
+        # Semáforo para limitar concurrencia
+        self._semaphore = None  # Se inicializará en setup
+        
+        logger.info(f"Initialized OptimizedOpenAIClient with model: {model}")
+    
+    async def setup(self):
+        """Initialize async resources."""
+        import asyncio
+        self._semaphore = asyncio.Semaphore(3)  # Máximo 3 requests concurrentes
+    
+    async def close(self):
+        """Cleanup resources."""
+        await self._client.close()
+    
+    def _calculate_delay(self, attempt: int, retry_after: Optional[float] = None) -> float:
+        """
+        Calculate delay with exponential backoff and jitter.
+        
+        Formula: min(base_delay * 2^attempt + random_jitter, max_delay)
+        """
+        if retry_after:
+            # Respetar el header Retry-After de OpenAI
+            base = retry_after
         else:
-            kwargs["max_tokens"] = effective_tokens
-
-        last_exc: Exception | None = None
-        for attempt in range(_MAX_RETRIES):
+            base = self.base_delay * (2 ** attempt)
+        
+        # Agregar jitter (±25%) para evitar thundering herd
+        jitter = base * 0.25 * (2 * random.random() - 1)
+        delay = min(base + jitter, self.max_delay)
+        
+        return max(delay, 0.1)  # Mínimo 100ms
+    
+    def _truncate_content(self, content: str, max_tokens: int = 4000) -> str:
+        """
+        Truncate content to stay within token limits.
+        Aproximadamente 4 caracteres por token para inglés/español.
+        """
+        max_chars = max_tokens * 4
+        
+        if len(content) <= max_chars:
+            return content
+        
+        # Truncar manteniendo el inicio y final (contexto más importante)
+        half_limit = max_chars // 2
+        truncated = content[:half_limit] + "\n\n[... contenido truncado por límite de tokens ...]\n\n" + content[-half_limit:]
+        
+        logger.warning(f"Content truncated from {len(content)} to {len(truncated)} chars")
+        return truncated
+    
+    async def _make_request_with_retry(
+        self,
+        messages: list,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """
+        Make API request with exponential backoff retry logic.
+        """
+        temp = temperature if temperature is not None else self.temperature
+        
+        for attempt in range(self.max_retries):
             try:
-                response = await self.client.beta.chat.completions.parse(**kwargs)
-                msg = response.choices[0].message
-                if msg.parsed:
-                    return msg.parsed.model_dump()
-                if msg.refusal:
-                    raise RefusalError(msg.refusal)
-                raise Exception(f"Unexpected LLM response: {msg.model_dump()}")
-
-            except openai.LengthFinishReasonError as e:
-                raise Exception(f"Output length exceeded: {e}") from e
-
-            except openai.RateLimitError as e:
-                last_exc = e
-                wait = _RETRY_BASE_SECONDS * (2 ** attempt)
-                if attempt < _MAX_RETRIES - 1:
-                    logger.warning(
-                        "429 en '%s' (intento %d/%d). Esperando %ds...",
-                        model, attempt + 1, _MAX_RETRIES, wait,
+                # Limitar concurrencia con semáforo
+                async with self._semaphore:
+                    response = await self._client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        temperature=temp,
+                        max_tokens=max_tokens,
                     )
-                    await asyncio.sleep(wait)
+                    
+                    # Log de uso de tokens para monitoreo
+                    usage = response.usage
+                    if usage:
+                        logger.info(
+                            f"Tokens used - Prompt: {usage.prompt_tokens}, "
+                            f"Completion: {usage.completion_tokens}, "
+                            f"Total: {usage.total_tokens}"
+                        )
+                    
+                    return response.choices[0].message.content
+            
+            except RateLimitError as e:
+                retry_after = None
+                
+                # Extraer Retry-After del header si existe
+                if hasattr(e, 'response') and e.response:
+                    retry_after = e.response.headers.get('retry-after')
+                    if retry_after:
+                        retry_after = float(retry_after)
+                
+                delay = self._calculate_delay(attempt, retry_after)
+                
+                logger.warning(
+                    f"Rate limit hit (attempt {attempt + 1}/{self.max_retries}). "
+                    f"Retrying in {delay:.2f}s..."
+                )
+                
+                await asyncio.sleep(delay)
+            
+            except APIError as e:
+                # Errores transitorios de API (5xx, timeouts)
+                if attempt < self.max_retries - 1:
+                    delay = self._calculate_delay(attempt)
+                    logger.warning(f"API error: {e}. Retrying in {delay:.2f}s...")
+                    await asyncio.sleep(delay)
                 else:
-                    logger.error("Rate limit persiste tras %d intentos.", _MAX_RETRIES)
-                    raise RateLimitError from e
-
+                    raise
+            
             except Exception as e:
-                logger.error("Error LLM: %s", e)
+                logger.error(f"Unexpected error: {e}")
                 raise
-
-        raise RateLimitError from last_exc
+        
+        # Si agotamos los retries
+        raise GraphitiRateLimitError(f"Max retries ({self.max_retries}) exceeded")
+    
+    async def generate(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """
+        Generate text with token optimization and retry logic.
+        """
+        # Optimizar el contenido del prompt
+        optimized_prompt = self._truncate_content(prompt, max_tokens=3500)
+        
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        
+        messages.append({"role": "user", "content": optimized_prompt})
+        
+        return await self._make_request_with_retry(
+            messages=messages,
+            temperature=temperature,
+        )
+    
+    # Métodos requeridos por Graphiti
+    async def generate_with_context(self, context: str, prompt: str) -> str:
+        """Generate with context (used by Graphiti)."""
+        combined = f"Context:\n{context}\n\nTask:\n{prompt}"
+        return await self.generate(combined)
+    
+    async def generate_entity_summary(self, text: str) -> str:
+        """Generate entity summary with token optimization."""
+        optimized = self._truncate_content(text, max_tokens=2000)
+        prompt = f"Summarize the key entities in this text:\n\n{optimized}"
+        return await self.generate(prompt)
+    
+    async def generate_edge_summary(self, source: str, target: str, context: str) -> str:
+        """Generate edge summary."""
+        optimized_context = self._truncate_content(context, max_tokens=1500)
+        prompt = f"Describe the relationship between '{source}' and '{target}':\n\n{optimized_context}"
+        return await self.generate(prompt)

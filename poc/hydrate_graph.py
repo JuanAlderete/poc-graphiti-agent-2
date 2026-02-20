@@ -1,180 +1,114 @@
-import argparse
 import asyncio
-import json
 import logging
-import re
-import time
-from typing import Any, Optional
+from pathlib import Path
+from typing import Optional
+
+from graphiti_core.nodes import EpisodeType
 
 from agent.config import settings
-from agent.db_utils import (
-    DatabasePool,
-    get_all_documents,
-    get_documents_missing_from_graph,
-    mark_document_graph_ingested,
-)
-from agent.graph_utils import GraphClient
-from poc.cost_calculator import calculate_cost
-from poc.token_tracker import tracker
+from agent.custom_openai_client import OptimizedOpenAIClient
+from agent.graph_utils import GraphManager
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-_MD_STRIP_STEPS = [
-    (re.compile(r"\[([^\]]*)\]\([^\)]*\)"), r"\1"),
-    (re.compile(r"#{1,6}\s+", re.MULTILINE), ""),
-    (re.compile(r"[*_`]{1,3}"), ""),
-    (re.compile(r"^\s*[-*+]\s+", re.MULTILINE), ""),
-    (re.compile(r"^\s*\d+\.\s+", re.MULTILINE), ""),
-    (re.compile(r"^>\s*", re.MULTILINE), ""),
-    (re.compile(r"\n{3,}"), "\n\n"),
-]
+# Directorio de documentos
+DOCS_DIR = Path(__file__).parent.parent / "documents_to_index"
 
-
-def _strip_markdown(text: str) -> str:
-    result = text
-    for pattern, replacement in _MD_STRIP_STEPS:
-        result = pattern.sub(replacement, result)
-    return result.strip()
-
-
-async def _process_one_doc(
-    doc: dict[str, Any],
-    delay_before: float = 0.0,
-) -> tuple[str, float]:
-    source = doc.get("title") or doc.get("source", "unknown")
-    doc_id = doc["id"]
-
-    meta = doc.get("metadata", {})
-    if isinstance(meta, str):
-        try:
-            meta = json.loads(meta)
-        except Exception:
-            meta = {}
-
-    content = doc.get("content", "")
-    if not content.strip():
-        logger.warning("Skipping %s - empty content.", source)
-        return doc_id, 0.0
-
-    graphiti_context = meta.get("graphiti_ready_context")
-
-    if delay_before > 0:
-        logger.info("Waiting %.1fs before next episode...", delay_before)
-        await asyncio.sleep(delay_before)
-
-    content_clean = _strip_markdown(content)
-
-    await GraphClient.add_episode(
-        content=content_clean,
-        source_reference=doc.get("source", source),
-        source_description=graphiti_context,
-    )
-
-    await mark_document_graph_ingested(doc_id)
-
-    est_tokens_in = tracker.estimate_tokens(content_clean)
-    est_tokens_out = int(est_tokens_in * 0.30)
-    cost = calculate_cost(est_tokens_in, est_tokens_out, settings.DEFAULT_MODEL)
-    logger.info("Episode '%s' done - est. cost $%.4f", source, cost)
-
-    return doc_id, cost
+# Usar un group_id consistente para todos los episodios
+# o None si quieres que estén disponibles globalmente
+DEFAULT_GROUP_ID = "hybrid_rag_documents"  # <-- Todos los docs en el mismo grupo
 
 
 async def hydrate_graph(
-    dry_run: bool = False,
-    limit: int = 1000,
-    reset_flags: bool = False,
-    delay_between_docs: float = 5.0,
-) -> None:
+    graph_manager: GraphManager,
+    group_id: Optional[str] = DEFAULT_GROUP_ID,  # <-- PASAR EL GROUP_ID
+):
     """
-    Lee documentos de Postgres y los ingesta en Graphiti de forma SECUENCIAL.
-
-    Args:
-        dry_run:            Preview sin gastar tokens.
-        limit:              Maximo de documentos a procesar.
-        reset_flags:        Si True, reprocesa todos (ignora graph_ingested).
-        delay_between_docs: Segundos entre episodios (default 5s).
+    Read all markdown files and add them as episodes to the graph.
     """
-    logger.info("=== HYDRATE GRAPH - Fase 2 ===")
-    await DatabasePool.init_db()
-
-    if reset_flags:
-        logger.info("--reset-flags: procesando TODOS los documentos.")
-        docs = await get_all_documents(limit=limit)
-    else:
-        docs = await get_documents_missing_from_graph(limit=limit)
-
-    if not docs:
-        logger.info("[OK] No hay documentos pendientes.")
+    if not DOCS_DIR.exists():
+        logger.error(f"Documents directory not found: {DOCS_DIR}")
         return
-
-    logger.info(
-        "Documentos a hidratar: %d | Modo: SECUENCIAL | Delay: %.1fs",
-        len(docs), delay_between_docs,
-    )
-
-    if dry_run:
-        logger.info("=== DRY RUN ===")
-        for doc in docs:
-            meta = doc.get("metadata", {})
-            context = meta.get("graphiti_ready_context", "[sin contexto]")
-            logger.info("  DOC: %s | CONTEXT: %s", doc["source"], context[:120])
-        logger.info("=== DRY RUN completado (%d docs) ===", len(docs))
-        return
-
-    logger.info("Initializing Graphiti...")
-    await GraphClient.ensure_schema()
-
-    total_cost = 0.0
-    processed_ids: set[str] = set()
-    error_count = 0
-    t0 = time.time()
-
-    for i, doc in enumerate(docs, 1):
-        source = doc.get("title") or doc.get("source", "unknown")
-        logger.info("--- [%d/%d] %s", i, len(docs), source)
-
+    
+    # Obtener todos los archivos .md
+    md_files = list(DOCS_DIR.glob("*.md"))
+    logger.info(f"Found {len(md_files)} markdown files to process")
+    
+    for md_file in md_files:
         try:
-            doc_id, cost = await _process_one_doc(
-                doc,
-                delay_before=delay_between_docs if i > 1 else 0.0,
+            content = md_file.read_text(encoding="utf-8")
+            doc_name = md_file.stem  # nombre sin extensión
+            
+            logger.info(f"Processing document: {doc_name}")
+            
+            # Agregar episodio con group_id consistente
+            episode_uuid = await graph_manager.add_episode(
+                content=content,
+                name=doc_name,
+                episode_type=EpisodeType.TEXT,
+                group_id=group_id,  # <-- USAR EL MISMO GROUP_ID
+                source_description=f"Document from {md_file.name}",
             )
-            processed_ids.add(doc_id)
-            total_cost += cost
+            
+            logger.info(f"Successfully added episode: {doc_name} (UUID: {episode_uuid})")
+            
+            # Pequeña pausa entre episodios para no saturar la API
+            await asyncio.sleep(0.5)
+            
         except Exception as e:
-            error_count += 1
-            logger.error("Error en '%s': %s", source, e)
+            logger.error(f"Error processing {md_file.name}: {e}")
+            continue
+    
+    logger.info("Graph hydration completed")
 
-    elapsed = time.time() - t0
-    success_count = len(processed_ids)
 
-    logger.info("=" * 55)
-    logger.info("HYDRATION COMPLETE")
-    logger.info("  Documentos procesados : %d", len(docs))
-    logger.info("  Exitosos              : %d", success_count)
-    logger.info("  Errores               : %d", error_count)
-    logger.info("  Tiempo total          : %.1fs (%.1f min)", elapsed, elapsed / 60)
-    logger.info("  Costo estimado total  : $%.4f", total_cost)
-    logger.info("  Costo promedio/doc    : $%.4f", total_cost / max(success_count, 1))
-    logger.info("=" * 55)
+async def verify_episodes(graph_manager: GraphManager):
+    """
+    Verify that all episodes were added correctly.
+    """
+    # Buscar TODOS los episodios (group_ids=None)
+    all_episodes = await graph_manager.get_all_episodes(group_ids=None)
+    
+    logger.info(f"Total episodes in graph: {len(all_episodes)}")
+    
+    for ep in all_episodes:
+        logger.info(f"  - {ep['name']} (group: {ep.get('group_id', 'N/A')})")
+    
+    return all_episodes
+
+
+async def main():
+    """Main entry point."""
+    # Inicializar cliente OpenAI optimizado
+    openai_client = OptimizedOpenAIClient(
+        api_key=settings.OPENAI_API_KEY,
+        model=settings.OPENAI_MODEL or "gpt-5-mini",
+    )
+    await openai_client.setup()
+    
+    # Inicializar GraphManager
+    graph_manager = GraphManager(
+        uri=settings.NEO4J_URI,
+        user=settings.NEO4J_USER,
+        password=settings.NEO4J_PASSWORD,
+        openai_client=openai_client,
+    )
+    await graph_manager.initialize()
+    
+    try:
+        # Hidratar el grafo
+        await hydrate_graph(graph_manager, group_id=DEFAULT_GROUP_ID)
+        
+        # Verificar que todos los episodios están ahí
+        episodes = await verify_episodes(graph_manager)
+        
+        logger.info(f"\nVerification complete: {len(episodes)} episodes in graph")
+        
+    finally:
+        await graph_manager.close()
+        await openai_client.close()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fase 2: Hidratacion de Graphiti")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--limit", type=int, default=1000)
-    parser.add_argument("--reset-flags", action="store_true")
-    parser.add_argument(
-        "--delay", type=float, default=5.0,
-        help="Segundos entre episodios (default 5). Usar 0 si el tier lo permite.",
-    )
-    args = parser.parse_args()
-    asyncio.run(
-        hydrate_graph(
-            dry_run=args.dry_run,
-            limit=args.limit,
-            reset_flags=args.reset_flags,
-            delay_between_docs=args.delay,
-        )
-    )
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
