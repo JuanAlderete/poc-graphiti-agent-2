@@ -1,3 +1,7 @@
+---
+trigger: always_on
+---
+
 # PROTOCOLO DE EJECUCIÓN OBLIGATORIA Y GESTIÓN DE CONTEXTO
 
 ## 1. Localización y Carga de Skills
