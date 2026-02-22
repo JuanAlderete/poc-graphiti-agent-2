@@ -339,6 +339,31 @@ El log lo confirmaba: `reasoning_tokens=2048` en cada intento fallido.
 
 ---
 
+#### BUG 4: NameError en retries por import faltante — `custom_openai_client.py`
+**Síntoma:** Los retries con backoff exponencial ante errores 429 nunca se ejecutaban; el sistema lanzaba `NameError: name 'asyncio' is not defined` en `_make_request_with_retry()`.
+
+**Causa raíz:** `import asyncio` solo estaba dentro del método `setup()` (scope local). Cuando `_make_request_with_retry()` llamaba a `asyncio.sleep(delay)`, el nombre `asyncio` no existía en el scope del módulo.
+
+**Fix:** Se movió `import asyncio` al nivel de módulo (línea 1). Además, se agregó inicialización perezosa del semáforo de concurrencia (`_semaphore`) dentro de `_make_request_with_retry()` para que el cliente funcione correctamente incluso si `setup()` nunca se llama.
+
+---
+
+#### BUG 5: Graphiti solo muestra un episodio — `graph_utils.py` + `hydrate_graph.py`
+**Síntoma:** Al consultar episodios después de la hidratación, solo aparecía un documento (ej. "Alex") en lugar de todos los documentos indexados.
+
+**Causa raíz:** El archivo `graph_utils.py` fue reescrito con una clase `GraphManager` (basada en instancias), pero el resto del código (`tools.py`, `ingest.py`, `run_poc.py`, `check_system.py`) importa `GraphClient` (singleton con `@classmethod`). Esto significa que:
+1. Los imports fallaban silenciosamente o el sistema usaba una instancia aislada.
+2. `add_episode()` no pasaba `group_id`, y cada episodio terminaba en un grupo distinto.
+3. La consulta de episodios no usaba `group_ids=None` para recuperar todos los grupos.
+
+**Fix:** Se restauró la clase `GraphClient` singleton compatible con el resto del código, con estas mejoras:
+- `add_episode()` ahora acepta y pasa `group_id` (default: `"hybrid_rag_documents"`) para que todos los documentos pertenezcan al mismo grupo.
+- Se agregó `get_all_episodes(group_ids=None)` que usa `client.get_episodes()` para recuperar episodios de **todos** los grupos.
+- Se agregaron métodos `reset()` y `_build_client()` requeridos por `run_poc.py` y `check_system.py`.
+- `hydrate_graph.py` fue actualizado para usar `GraphClient` en lugar de `GraphManager`.
+
+---
+
 ### Optimizaciones de costo
 
 | Módulo | Cambio | Ahorro estimado |

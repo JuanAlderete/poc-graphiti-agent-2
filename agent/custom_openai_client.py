@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 import random
@@ -53,7 +54,6 @@ class OptimizedOpenAIClient(LLMClient):
     
     async def setup(self):
         """Initialize async resources."""
-        import asyncio
         self._semaphore = asyncio.Semaphore(3)  # Máximo 3 requests concurrentes
     
     async def close(self):
@@ -105,6 +105,10 @@ class OptimizedOpenAIClient(LLMClient):
         Make API request with exponential backoff retry logic.
         """
         temp = temperature if temperature is not None else self.temperature
+        
+        # Lazy-init semaphore if setup() was never called
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(3)
         
         for attempt in range(self.max_retries):
             try:

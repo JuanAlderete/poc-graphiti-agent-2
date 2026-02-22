@@ -3,110 +3,92 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from graphiti_core.nodes import EpisodeType
-
-from agent.config import settings
-from agent.custom_openai_client import OptimizedOpenAIClient
-from agent.graph_utils import GraphManager
+from agent.graph_utils import GraphClient, DEFAULT_GROUP_ID
 
 logger = logging.getLogger(__name__)
 
 # Directorio de documentos
 DOCS_DIR = Path(__file__).parent.parent / "documents_to_index"
 
-# Usar un group_id consistente para todos los episodios
-# o None si quieres que estén disponibles globalmente
-DEFAULT_GROUP_ID = "hybrid_rag_documents"  # <-- Todos los docs en el mismo grupo
-
 
 async def hydrate_graph(
-    graph_manager: GraphManager,
-    group_id: Optional[str] = DEFAULT_GROUP_ID,  # <-- PASAR EL GROUP_ID
+    group_id: Optional[str] = DEFAULT_GROUP_ID,
+    delay: float = 0.5,
 ):
     """
-    Read all markdown files and add them as episodes to the graph.
+    Read all markdown files and add them as episodes to the graph
+    using GraphClient (singleton).
+
+    Args:
+        group_id: Logical group for all episodes. Uses DEFAULT_GROUP_ID
+            so all documents are retrievable with a single query.
+        delay: Seconds to sleep between episodes to avoid rate limits.
     """
     if not DOCS_DIR.exists():
-        logger.error(f"Documents directory not found: {DOCS_DIR}")
+        logger.error("Documents directory not found: %s", DOCS_DIR)
         return
-    
-    # Obtener todos los archivos .md
-    md_files = list(DOCS_DIR.glob("*.md"))
-    logger.info(f"Found {len(md_files)} markdown files to process")
-    
+
+    md_files = sorted(DOCS_DIR.glob("*.md"))
+    logger.info("Found %d markdown files to process", len(md_files))
+
     for md_file in md_files:
         try:
             content = md_file.read_text(encoding="utf-8")
-            doc_name = md_file.stem  # nombre sin extensión
-            
-            logger.info(f"Processing document: {doc_name}")
-            
-            # Agregar episodio con group_id consistente
-            episode_uuid = await graph_manager.add_episode(
+            doc_name = md_file.stem
+
+            logger.info("Processing document: %s", doc_name)
+
+            await GraphClient.add_episode(
                 content=content,
-                name=doc_name,
-                episode_type=EpisodeType.TEXT,
-                group_id=group_id,  # <-- USAR EL MISMO GROUP_ID
+                source_reference=doc_name,
                 source_description=f"Document from {md_file.name}",
+                group_id=group_id,
             )
-            
-            logger.info(f"Successfully added episode: {doc_name} (UUID: {episode_uuid})")
-            
-            # Pequeña pausa entre episodios para no saturar la API
-            await asyncio.sleep(0.5)
-            
+
+            logger.info("Successfully added episode: %s", doc_name)
+
+            if delay > 0:
+                await asyncio.sleep(delay)
+
         except Exception as e:
-            logger.error(f"Error processing {md_file.name}: {e}")
+            logger.error("Error processing %s: %s", md_file.name, e)
             continue
-    
+
     logger.info("Graph hydration completed")
 
 
-async def verify_episodes(graph_manager: GraphManager):
+async def verify_episodes():
     """
     Verify that all episodes were added correctly.
+    Passes group_ids=None to retrieve ALL episodes regardless of group.
     """
-    # Buscar TODOS los episodios (group_ids=None)
-    all_episodes = await graph_manager.get_all_episodes(group_ids=None)
-    
-    logger.info(f"Total episodes in graph: {len(all_episodes)}")
-    
+    all_episodes = await GraphClient.get_all_episodes(group_ids=None)
+
+    logger.info("Total episodes in graph: %d", len(all_episodes))
+
     for ep in all_episodes:
-        logger.info(f"  - {ep['name']} (group: {ep.get('group_id', 'N/A')})")
-    
+        logger.info("  - %s (group: %s)", ep["name"], ep.get("group_id", "N/A"))
+
     return all_episodes
 
 
 async def main():
     """Main entry point."""
-    # Inicializar cliente OpenAI optimizado
-    openai_client = OptimizedOpenAIClient(
-        api_key=settings.OPENAI_API_KEY,
-        model=settings.OPENAI_MODEL or "gpt-5-mini",
-    )
-    await openai_client.setup()
-    
-    # Inicializar GraphManager
-    graph_manager = GraphManager(
-        uri=settings.NEO4J_URI,
-        user=settings.NEO4J_USER,
-        password=settings.NEO4J_PASSWORD,
-        openai_client=openai_client,
-    )
-    await graph_manager.initialize()
-    
+    # Ensure schema/indices exist
+    await GraphClient.ensure_schema()
+
     try:
-        # Hidratar el grafo
-        await hydrate_graph(graph_manager, group_id=DEFAULT_GROUP_ID)
-        
-        # Verificar que todos los episodios están ahí
-        episodes = await verify_episodes(graph_manager)
-        
-        logger.info(f"\nVerification complete: {len(episodes)} episodes in graph")
-        
-    finally:
-        await graph_manager.close()
-        await openai_client.close()
+        # Hydrate the graph
+        await hydrate_graph(group_id=DEFAULT_GROUP_ID)
+
+        # Verify that ALL episodes are visible
+        episodes = await verify_episodes()
+
+        logger.info("Verification complete: %d episodes in graph", len(episodes))
+
+    except Exception:
+        logger.exception("Hydration failed")
+        raise
 
 
 if __name__ == "__main__":
