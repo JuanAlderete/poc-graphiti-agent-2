@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Dict, List, Tuple
 
 import google.generativeai as genai
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 
 from agent.config import settings
 from poc.token_tracker import tracker
@@ -62,6 +62,13 @@ class EmbeddingGenerator:
             response = await self.client.embeddings.create(input=texts, model=self.model)
             embeddings = [d.embedding for d in sorted(response.data, key=lambda d: d.index)]
             return embeddings, response.usage.total_tokens
+        except RateLimitError as e:
+            if getattr(e, "code", None) == "insufficient_quota":
+                logger.critical(
+                    "FATAL: OpenAI quota exceeded during batch embedding. "
+                    "Please top up your account at https://platform.openai.com/account/billing"
+                )
+            raise
         except Exception:
             logger.exception("Error en batch embedding OpenAI")
             raise
@@ -72,6 +79,13 @@ class EmbeddingGenerator:
         try:
             response = await self.client.embeddings.create(input=[text], model=self.model)
             return response.data[0].embedding, response.usage.total_tokens
+        except RateLimitError as e:
+            if getattr(e, "code", None) == "insufficient_quota":
+                logger.critical(
+                    "FATAL: OpenAI quota exceeded during embedding. "
+                    "Please top up your account at https://platform.openai.com/account/billing"
+                )
+            raise
         except Exception:
             logger.exception("Error en embedding OpenAI")
             raise

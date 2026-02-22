@@ -364,6 +364,18 @@ El log lo confirmaba: `reasoning_tokens=2048` en cada intento fallido.
 
 ---
 
+#### BUG 6: Retries infinitos ante quota agotada — `custom_openai_client.py`, `embedder.py`, `run_poc.py`
+**Síntoma:** Cuando la cuenta de OpenAI no tiene créditos, la API responde con 429 y `code: insufficient_quota`. El sistema reintentaba indefinidamente (hasta 5 veces con delays crecientes) sin jamas poder triunfar, y terminaba con un `KeyboardInterrupt` del usuario.
+
+**Causa raíz:** OpenAI usa el mismo código HTTP 429 para dos tipos de error muy distintos: (1) rate limit transitório (se recupera solo) y (2) quota agotada (requiere acción del usuario). El código anterior no diferenciaba entre ellos.
+
+**Fix:**
+- `custom_openai_client.py`: En el handler de `RateLimitError`, se verifica `e.code == 'insufficient_quota'` antes de calcular el backoff. Si es quota, se loggea un mensaje `CRITICAL` con el link de billing y se re-lanza inmediatamente sin reintentos.
+- `embedder.py`: Mismo chequeo en `generate_embeddings_batch()` y `_embed_one()` para errores de embedding.
+- `run_poc.py`: Se separa `_main()` de `main()`. El wrapper `main()` captura cualquier excepción, detecta si es quota (por `e.code` o por contenido del mensaje), muestra un banner `FATAL ERROR` con instrucción clara y sale con `SystemExit(1)` en lugar de crashear con `CancelledError` o `KeyboardInterrupt`.
+
+---
+
 ### Optimizaciones de costo
 
 | Módulo | Cambio | Ahorro estimado |

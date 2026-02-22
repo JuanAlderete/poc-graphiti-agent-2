@@ -133,21 +133,31 @@ class OptimizedOpenAIClient(LLMClient):
                     return response.choices[0].message.content
             
             except RateLimitError as e:
+                # insufficient_quota = billing problem, not a transient rate limit.
+                # Retrying is useless — stop immediately with a clear message.
+                error_code = getattr(e, "code", None)
+                if error_code == "insufficient_quota":
+                    logger.critical(
+                        "FATAL: OpenAI quota exceeded (insufficient_quota). "
+                        "Please top up your account at https://platform.openai.com/account/billing"
+                    )
+                    raise
+
                 retry_after = None
-                
+
                 # Extraer Retry-After del header si existe
                 if hasattr(e, 'response') and e.response:
                     retry_after = e.response.headers.get('retry-after')
                     if retry_after:
                         retry_after = float(retry_after)
-                
+
                 delay = self._calculate_delay(attempt, retry_after)
-                
+
                 logger.warning(
                     f"Rate limit hit (attempt {attempt + 1}/{self.max_retries}). "
                     f"Retrying in {delay:.2f}s..."
                 )
-                
+
                 await asyncio.sleep(delay)
             
             except APIError as e:

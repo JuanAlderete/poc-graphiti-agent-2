@@ -109,6 +109,28 @@ async def run_generation_tests() -> None:
 
 
 async def main() -> None:
+    try:
+        await _main()
+    except Exception as e:
+        # Detect billing quota exhaustion (distinct from transient 429 rate limits)
+        code = getattr(e, "code", None)
+        is_quota = code == "insufficient_quota" or (
+            "insufficient_quota" in str(e)
+        )
+        if is_quota:
+            logger.critical(
+                "\n"
+                "========================================================\n"
+                "  FATAL ERROR: OpenAI quota exceeded (insufficient_quota)\n"
+                "  Your account has no remaining credits.\n"
+                "  Top up at: https://platform.openai.com/account/billing\n"
+                "========================================================"
+            )
+            raise SystemExit(1)
+        raise
+
+
+async def _main() -> None:
     parser = argparse.ArgumentParser(description="Run Graphiti POC")
     parser.add_argument("--skip-checks", action="store_true", help="Skip health checks")
     parser.add_argument("--ingest", type=str, help="Directory to ingest docs from")
