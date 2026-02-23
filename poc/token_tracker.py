@@ -83,6 +83,14 @@ class TokenTracker:
                 }
             )
 
+        # Feed budget guard OUTSIDE the lock to avoid deadlock (budget_guard has its own lock)
+        if cost > 0:
+            try:
+                from poc.budget_guard import record_cost
+                record_cost(cost)
+            except Exception:
+                pass  # Budget guard failures must never break normal operation
+
     def estimate_tokens(self, text: Optional[str]) -> int:
         """Estimate token count for *text*. Falls back to char/4 heuristic."""
         if not text:

@@ -68,7 +68,18 @@ async def graph_search_tool(query: str) -> List[SearchResult]:
     tracker.start_operation(op_id, "graph_search")
 
     tokens_in = tracker.estimate_tokens(query)
-    results_text = await GraphClient.search(query)
+    results_raw = await GraphClient.search(query)
+
+    # Compatibilidad: results puede ser lista de strings o lista de objetos Graphiti
+    results_text = []
+    for r in results_raw:
+        if isinstance(r, str):
+            results_text.append(r[:500])
+        elif hasattr(r, 'fact'):
+            results_text.append(str(r.fact)[:500])
+        else:
+            results_text.append(str(r)[:500])
+
     tokens_out = sum(tracker.estimate_tokens(t) for t in results_text)
     tracker.record_usage(op_id, tokens_in, tokens_out, settings.DEFAULT_MODEL, "graph_search_llm")
 

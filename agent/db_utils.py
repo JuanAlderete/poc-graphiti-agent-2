@@ -323,3 +323,32 @@ async def get_document_summary() -> List[Dict[str, Any]]:
         except Exception as e:
             logger.error(f"Error fetching document summary: {e}")
             return []
+
+
+async def get_chunks_by_document_source(
+    source_name: str,
+    limit: int = 5,
+) -> list[dict]:
+    """
+    Retorna chunks de documentos cuyo `source` coincide con source_name.
+    Usado por RetrievalEngine para buscar chunks de un episodio específico del grafo.
+
+    Args:
+        source_name: Nombre del documento/episodio (ej: 'alex.md' o 'alex').
+    """
+    async with get_db_connection() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT c.content, c.metadata, d.title, d.source, d.graphiti_episode_id,
+                   c.chunk_index
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.id
+            WHERE d.source ILIKE $1 OR d.source ILIKE $2 OR d.title ILIKE $1
+            ORDER BY c.chunk_index ASC
+            LIMIT $3
+            """,
+            f"%{source_name}%",
+            f"{source_name}%",
+            limit,
+        )
+        return [dict(row) for row in rows]

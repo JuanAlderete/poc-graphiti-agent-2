@@ -1,0 +1,4 @@
+Headlines: máx 30 chars c/u, usar número o pregunta.
+Descripciones: máx 90 chars c/u, incluir beneficio concreto.
+Copy principal: 1-3 párrafos, empezar con el pain point.
+CTA: usar verbos de acción (Descubrir, Empezar, Ver, etc.).

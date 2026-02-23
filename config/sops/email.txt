@@ -1,0 +1,5 @@
+Asunto: máx 60 caracteres, usar número o pregunta si es posible.
+Preheader: complementa el asunto, máx 90 caracteres.
+Cuerpo: intro de 1 oración + 3 tips/puntos + párrafo de cierre.
+CTA: un solo botón/link con texto de acción específico.
+Tono: profesional pero cercano. Evitar palabras de spam (gratis, URGENTE, etc.).

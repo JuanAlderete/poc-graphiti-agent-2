@@ -108,6 +108,42 @@ async def run_generation_tests() -> None:
     logger.info("Generation tests complete.")
 
 
+async def run_generation_with_agents(
+    formato: str = "reel_cta",
+    topic: str = "Validación de ideas de negocio",
+    context: str = "",
+    **kwargs,
+) -> "AgentOutput":
+    """
+    Generación usando los nuevos agentes estructurados.
+    Retorna AgentOutput con datos estructurados por formato.
+    """
+    from services.generation_service import GenerationService
+
+    if not context:
+        # Si no se pasa contexto, hacer una búsqueda híbrida para obtenerlo
+        results = await hybrid_search_tool(topic, limit=3)
+        context = "\n\n---\n\n".join(r.content for r in results) if results else "Sin contexto disponible."
+
+    service = GenerationService()
+    output = await service.generate(formato, topic=topic, context=context, **kwargs)
+
+    print(f"\n{'='*50}")
+    print(f"FORMATO: {output.formato.upper()}")
+    print(f"TEMA: {output.topic}")
+    print(f"QA: {'✅ PASSED' if output.qa_passed else '❌ FAILED'}")
+    if not output.qa_passed:
+        print(f"QA NOTES: {output.qa_notes}")
+    print(f"COSTO: ${output.cost_usd:.4f}")
+    print(f"{'='*50}")
+    print("OUTPUT ESTRUCTURADO:")
+    import json
+    print(json.dumps(output.data, ensure_ascii=False, indent=2))
+    print(f"{'='*50}\n")
+
+    return output
+
+
 async def main() -> None:
     try:
         await _main()
@@ -140,6 +176,9 @@ async def _main() -> None:
     parser.add_argument("--skip-graphiti", action="store_true", help="Skip Graphiti (Postgres only)")
     parser.add_argument("--clear-logs", action="store_true", help="Clear CSV logs before running")
     parser.add_argument("--clear-db", action="store_true", help="Clear Postgres DB before running")
+    parser.add_argument("--generate-structured", action="store_true", help="Run generation with structured agents")
+    parser.add_argument("--formato", type=str, default="reel_cta", help="Format for structured generation: reel_cta|historia|email|reel_lead_magnet|ads")
+    parser.add_argument("--topic", type=str, default="Validación de ideas de negocio", help="Topic for structured generation")
 
     args = parser.parse_args()
 
@@ -177,6 +216,10 @@ async def _main() -> None:
     # ── Generación ────────────────────────────────────────────────────────────
     if args.generate or args.all:
         await run_generation_tests()
+
+    # ── Generación con Agentes Estructurados ──────────────────────────────────
+    if args.generate_structured:
+        await run_generation_with_agents(formato=args.formato, topic=args.topic)
 
 
 if __name__ == "__main__":

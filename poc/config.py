@@ -27,6 +27,20 @@ class AppConfig(BaseSettings):
     DEFAULT_MODEL: str = Field(default="gpt-5-mini")
     EMBEDDING_MODEL: str = Field(default="text-embedding-3-small")
 
+    # Budget Control (Tarea 4)
+    MONTHLY_BUDGET_USD: float = Field(
+        default=10.0,
+        description="Monthly budget cap in USD. Set to 0 to disable budget control."
+    )
+    FALLBACK_MODEL: str = Field(
+        default="gpt-4o-mini",
+        description="Cheaper model to use when monthly budget exceeds 90%."
+    )
+    BUDGET_TRACKING_FILE: str = Field(
+        default="logs/monthly_budget.json",
+        description="JSON file where monthly spending is tracked."
+    )
+
     @model_validator(mode="after")
     def _resolve_gemini_defaults(self) -> "AppConfig":
         """
@@ -71,6 +85,8 @@ MODEL_PRICING: dict[str, ModelPricing] = {
     "gpt-5-mini":               ModelPricing(0.080, 0.320),
     "gpt-4o-mini":              ModelPricing(0.150, 0.600),
     "gpt-4o":                   ModelPricing(2.50,  10.00),
+    "o1-mini":                  ModelPricing(3.00,  12.00),
+    "o1-preview":               ModelPricing(15.00, 60.00),
     "text-embedding-3-small":   ModelPricing(0.020, 0.0),
     "text-embedding-3-large":   ModelPricing(0.130, 0.0),
     # Gemini

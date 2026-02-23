@@ -1,0 +1,5 @@
+La secuencia debe tener entre 5 y 7 slides.
+Slide 1: Hook visual con pregunta o stat impactante.
+Slides 2-5: Contenido educativo o narrativo, un punto por slide.
+Último slide: CTA claro.
+Máx 30 palabras por slide. Usar emojis con moderación (máx 2 por slide).

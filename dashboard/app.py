@@ -278,6 +278,68 @@ with tab_gen:
             except Exception as exc:
                 st.error(f"Generation failed: {exc}")
 
+    # ── Sección: Agentes Estructurados (NUEVO) ─────────────────────────────────
+    st.divider()
+    st.subheader("🤖 Generación con Agentes Estructurados (Nuevo)")
+    st.caption("Output estructurado por formato con campos específicos (Hook, Script, CTA, etc.)")
+
+    col_fmt, col_topic = st.columns(2)
+    with col_fmt:
+        new_formato = st.selectbox(
+            "Formato",
+            ["reel_cta", "historia", "email", "reel_lead_magnet", "ads"],
+            key="new_gen_formato"
+        )
+    with col_topic:
+        new_topic = st.text_input("Tema", "Validación de ideas de negocio", key="new_gen_topic")
+
+    new_context = st.text_area("Contexto (dejar vacío para búsqueda automática)", "", height=100, key="new_gen_context")
+
+    extra_params = {}
+    if new_formato == "reel_cta":
+        extra_params["cta"] = st.text_input("CTA", "Sígueme para más", key="reel_cta_cta")
+    elif new_formato == "historia":
+        extra_params["tone"] = st.text_input("Tono", "Educativo y cercano", key="historia_tone")
+        extra_params["tipo"] = st.selectbox("Tipo", ["educativa", "autoridad", "prueba_social", "cta"], key="historia_tipo")
+    elif new_formato == "email":
+        extra_params["objective"] = st.text_input("Objetivo", "Generar interés", key="email_obj")
+    elif new_formato == "reel_lead_magnet":
+        extra_params["lead_magnet"] = st.text_input("Lead Magnet", "Checklist gratuita", key="rlm_lm")
+    elif new_formato == "ads":
+        extra_params["tipo"] = st.selectbox("Tipo de anuncio", ["awareness", "consideration", "conversion"], key="ads_tipo")
+
+    if st.button("🚀 Generar con Agente Estructurado"):
+        with st.spinner(f"Generando {new_formato}…"):
+            try:
+                from services.generation_service import GenerationService
+                from poc.budget_guard import get_budget_summary
+
+                if not new_context:
+                    results = run_async(hybrid_search_tool(new_topic, limit=3))
+                    context_for_gen = "\n\n---\n\n".join(r.content for r in results) if results else "Sin contexto."
+                else:
+                    context_for_gen = new_context
+
+                service = GenerationService()
+                output = run_async(service.generate(new_formato, topic=new_topic, context=context_for_gen, **extra_params))
+
+                # Budget summary
+                budget = get_budget_summary()
+                if budget["status"] == "critical":
+                    st.warning(f"⚠️ Budget crítico: {budget['percentage']}% usado. Usando modelo fallback: {budget['active_model']}")
+                elif budget["status"] == "warning":
+                    st.info(f"💡 Budget al {budget['percentage']}%. Gasto: ${budget['spent_usd']} / ${budget['budget_usd']}")
+
+                st.success(f"✅ QA {'PASSED' if output.qa_passed else 'FAILED'} | Costo: ${output.cost_usd:.4f}")
+
+                if not output.qa_passed:
+                    st.warning(f"QA notas: {output.qa_notes}")
+
+                st.json(output.data)
+
+            except Exception as exc:
+                st.error(f"Error: {exc}")
+
 
 # ── TAB 4: ANALYTICS ────────────────────────────────────────────────────────
 with tab_analytics:
@@ -351,6 +413,28 @@ with tab_analytics:
                 st.scatter_chart(df_gen, x="tokens_out", y="tiempo_seg", color="modelo")
         else:
             st.info("No generation logs yet.")
+
+    # ── Budget Panel (NUEVO) ─────────────────────────────────────────────
+    st.divider()
+    st.subheader("💰 Estado del Presupuesto")
+    try:
+        from poc.budget_guard import get_budget_summary
+        budget = get_budget_summary()
+
+        col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+        col_b1.metric("Gastado este mes", f"${budget['spent_usd']:.2f}")
+        col_b2.metric("Budget mensual", f"${budget['budget_usd']:.2f}")
+        col_b3.metric("% Usado", f"{budget['percentage']}%")
+        col_b4.metric("Proyección mensual", f"${budget['projected_monthly']:.2f}")
+
+        if budget["fallback_active"]:
+            st.error(f"🔴 Modelo fallback activo: **{budget['active_model']}**")
+        elif budget["status"] == "warning":
+            st.warning(f"🟡 Budget al {budget['percentage']}% — modelo normal: **{budget['active_model']}**")
+        else:
+            st.success(f"🟢 Budget OK — modelo activo: **{budget['active_model']}**")
+    except Exception as e:
+        st.info(f"Budget tracking no disponible: {e}")
 
 
 # ── TAB 5: PROYECCIONES ─────────────────────────────────────────────────────

@@ -150,9 +150,19 @@ class GraphClient:
         try:
             from graphiti_core.nodes import EpisodeType
 
+            # Truncar contenido para reducir costos de Graphiti (solo necesita los primeros 2000 chars
+            # para extraer entidades y relaciones. El texto completo vive en Postgres).
+            _MAX_EPISODE_CHARS = 2000
+            truncated_content = content[:_MAX_EPISODE_CHARS] if len(content) > _MAX_EPISODE_CHARS else content
+            if len(content) > _MAX_EPISODE_CHARS:
+                logger.debug(
+                    "Episode content truncated for Graphiti: %d → %d chars (%s)",
+                    len(content), _MAX_EPISODE_CHARS, source_reference
+                )
+
             await client.add_episode(
                 name=source_reference,
-                episode_body=content,
+                episode_body=truncated_content,
                 source_description=effective_description,
                 reference_time=datetime.now(),
                 source=EpisodeType.text,
@@ -235,7 +245,18 @@ class GraphClient:
     # ------------------------------------------------------------------
 
     @classmethod
-    async def search(cls, query: str) -> List[str]:
+    async def search(cls, query: str, num_results: int = 5) -> list:
+        """
+        Busca en el knowledge graph. Retorna lista de objetos Edge de Graphiti.
+
+        IMPORTANTE: Retorna objetos crudos (no strings) para que RetrievalEngine
+        pueda extraer episode metadata de ellos. Los objetos tienen __str__ que
+        retorna el fact como string, por lo que son retrocompatibles.
+        """
         client = cls.get_client()
-        results = await client.search(query)
-        return [str(r) for r in results] if results else []
+        try:
+            results = await client.search(query, num_results=num_results)
+            return results if results else []
+        except Exception:
+            logger.exception("Error en graph search: %s", query)
+            return []

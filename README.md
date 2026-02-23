@@ -427,5 +427,86 @@ Graphiti realiza ~30 llamadas LLM internas por episodio, y cada una recibe el te
 **¿Por qué `gpt-5-mini` necesita `max_completion_tokens = 8192`?**
 `gpt-5-mini` pertenece a la familia de modelos de razonamiento (`o1`). Antes de producir output visible, consume *reasoning tokens* de forma interna. Con el límite por defecto de 2048 tokens, el modelo usa todos los tokens en razonamiento y no le queda espacio para generar el JSON estructurado que Graphiti necesita. Aumentar el límite a 8192 da el espacio necesario; los tokens no usados no se cobran.
 
-**¿Por qué la hidratación es secuencial y no paralela?**
+**Por que la hidratacion es secuencial y no paralela?**
 `add_episode()` dispara internamente ~30 llamadas LLM en paralelo. Si se procesan 2-3 episodios simultáneos, se multiplican las llamadas paralelas por 2-3, agotando el límite de tokens por minuto (TPM) en segundos. El procesamiento secuencial con un delay de 5 segundos entre episodios permite que la ventana de TPM se renueve parcialmente y elimina los errores 429.
+
+---
+
+## 12. Nuevos Componentes — Motor IA Novolabs
+
+Esta sección documenta las 5 nuevas capas funcionales agregadas al proyecto.
+
+### Tarea 1 — Capa de Servicios (`services/`)
+
+Una capa intermedia entre el dashboard/API y la lógica interna. Separa "qué hace el sistema" de "cómo lo hace internamente", facilitando crear una API REST en el futuro sin tocar el dashboard.
+
+| Archivo | Qué hace |
+|---|---|
+| `services/ingestion_service.py` | Orquesta la ingesta: deduplicación, chunking, embeddings, almacenamiento |
+| `services/generation_service.py` | Delega al agente correcto y retorna el output estructurado |
+| `services/search_service.py` | Fachada para los 4 modos de búsqueda (vector, grafo, híbrido, híbrido-real) |
+
+### Tarea 2 — Fuentes de Documentos Enchufables (`ingestion/sources/`)
+
+El sistema ahora puede ingestar desde cualquier origen de datos sin modificar el pipeline principal.
+
+| Archivo | Qué hace |
+|---|---|
+| `ingestion/sources/base.py` | Clase abstracta `DocumentSource` — define el contrato que toda fuente debe cumplir |
+| `ingestion/sources/local_file_source.py` | Lee archivos `.md` desde una carpeta local (implementado) |
+| `ingestion/sources/google_drive_source.py` | Stub para futura integración con Google Drive (Fase 1) |
+
+**Uso:** `from ingestion.ingest import ingest_from_source` — acepta cualquier `DocumentSource`.
+
+### Tarea 3 — Agentes de Generación Estructurada (`poc/agents/`)
+
+Cada formato de contenido tiene su propio agente con instrucciones específicas (SOP) y validación de calidad. El output no es texto libre — es un objeto JSON con campos definidos (Hook, Script, CTA, etc.).
+
+| Agente | Formato que genera |
+|---|---|
+| `ReelCTAAgent` | Guion de reel (Instagram/TikTok) con CTA |
+| `HistoriaAgent` | Secuencia de 5-7 Stories de Instagram |
+| `EmailAgent` | Email de newsletter o outreach |
+| `ReelLeadMagnetAgent` | Reel que promociona un recurso gratuito |
+| `AdsAgent` | Copy para Meta Ads o Google Ads |
+
+Los archivos de instrucciones (SOPs) están en `config/sops/` y pueden editarse sin tocar código.
+
+**Uso en dashboard:** Tab "Generation" → sección "Agentes Estructurados" → elegir formato → completar campos → botón "Generar con Agente Estructurado".
+
+**Uso en CLI:** `python -m poc.run_poc --generate-structured --formato reel_cta --topic "tu tema"`
+
+### Tarea 4 — Control de Presupuesto (`poc/budget_guard.py`)
+
+Evita sorpresas de facturación al monitorear el gasto mensual acumulado y cambiar automáticamente al modelo más barato cuando se supera el 90% del límite.
+
+| Variable de entorno (`.env`) | Valor por defecto | Qué hace |
+|---|---|---|
+| `MONTHLY_BUDGET_USD` | `10.0` | Límite mensual en USD. `0` = desactivado |
+| `FALLBACK_MODEL` | `gpt-4o-mini` | Modelo barato que se activa al llegar al 90% |
+| `BUDGET_TRACKING_FILE` | `logs/monthly_budget.json` | Donde se guarda el gasto acumulado |
+
+**Alertas automáticas:** WARNING al 70%, CRITICAL al 90% (con cambio de modelo).
+
+El presupuesto se muestra en el dashboard (tab Analytics → sección "Estado del Presupuesto").
+
+### Tarea 5 — Motor de Búsqueda Híbrido Real (`agent/retrieval_engine.py`)
+
+La búsqueda híbrida existente combina vector y FTS dentro de Postgres solamente. `RetrievalEngine` agrega un tercer paso: usa Neo4j para identificar qué documentos son conceptualmente relevantes, y luego va a Postgres a buscar el texto literal de esos documentos.
+
+```
+Query del usuario
+      │
+      ▼
+ Neo4j / Graphiti   → identifica "qué documentos mencionan este concepto"
+      │
+      ▼
+  PostgreSQL       → trae los chunks literales de esos documentos
+      │
+      ▼
+ Resultado enriquecido (contexto conceptual + texto literal)
+```
+
+**Cuándo usar `hybrid_real`:** Cuando la query es relacional ("qué dijo X sobre Y", "qué documentos hablan de Z"). Para queries semánticas directas, `hybrid` sigue siendo más rápido.
+
+**Fallback automático:** Si Neo4j no retorna resultados, el motor cae automáticamente a búsqueda vectorial.

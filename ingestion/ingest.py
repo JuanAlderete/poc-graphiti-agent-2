@@ -157,3 +157,76 @@ if __name__ == "__main__":
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     asyncio.run(ingest_directory(args.dir, skip_graphiti=args.skip_graphiti))
+
+
+async def ingest_from_source(
+    source,
+    skip_graphiti: bool = False,
+    concurrency: int = 1,
+) -> dict:
+    """
+    Ingesta documentos desde cualquier implementación de DocumentSource.
+
+    Args:
+        source: Cualquier instancia que implemente DocumentSource
+                (LocalFileSource, GoogleDriveSource, etc.)
+        skip_graphiti: Si True, solo ingesta en Postgres.
+        concurrency: Cuántos documentos procesar en paralelo.
+                     Mantener en 1 cuando Graphiti está activo.
+
+    Returns:
+        dict con {successes, errors, total_cost_usd, elapsed_sec}
+
+    Ejemplo de uso con LocalFileSource:
+        from ingestion.sources.local_file_source import LocalFileSource
+        source = LocalFileSource("documents_to_index")
+        result = await ingest_from_source(source)
+
+    Ejemplo futuro con GoogleDriveSource:
+        source = GoogleDriveSource(folder_id="1abc...")
+        result = await ingest_from_source(source)
+    """
+    from services.ingestion_service import IngestionService
+
+    pipeline = DocumentIngestionPipeline()
+    await DatabasePool.init_db()
+    if not skip_graphiti:
+        await GraphClient.ensure_schema()
+
+    logger.info("Listing documents from source: %s", source.source_name())
+    docs = await source.list_documents()
+
+    if not docs:
+        logger.warning("No documents found in source: %s", source.source_name())
+        return {"successes": 0, "errors": 0, "total_cost_usd": 0.0, "elapsed_sec": 0.0}
+
+    t0 = time.time()
+    service = IngestionService()
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _ingest_one(doc):
+        async with sem:
+            return await service.ingest_document(
+                content=doc.content,
+                filename=doc.filename,
+                skip_graphiti=skip_graphiti,
+                source_type=doc.source_type,
+            )
+
+    results = await asyncio.gather(*(_ingest_one(doc) for doc in docs), return_exceptions=True)
+
+    successes = sum(1 for r in results if hasattr(r, "chunks_created") and not r.error and not r.skipped)
+    errors = sum(1 for r in results if isinstance(r, Exception) or (hasattr(r, "error") and r.error))
+    total_cost = sum(r.cost_usd for r in results if hasattr(r, "cost_usd") and r.cost_usd)
+    elapsed = time.time() - t0
+
+    logger.info(
+        "ingest_from_source done: %d/%d ok — errors: %d — cost: $%.4f — time: %.1fs",
+        successes, len(docs), errors, total_cost, elapsed
+    )
+    return {
+        "successes": successes,
+        "errors": errors,
+        "total_cost_usd": round(total_cost, 6),
+        "elapsed_sec": round(elapsed, 2),
+    }
