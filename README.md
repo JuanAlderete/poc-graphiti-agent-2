@@ -155,12 +155,52 @@ python -m poc.hydrate_graph --reset-flags
 
 ## Instalación y configuración
 
-### Requisitos
+### Opción A — Docker (recomendado)
+
+Todo el stack se levanta con un solo comando. Solo necesitás Docker y (opcionalmente) Ollama en el host.
+
+```bash
+git clone <repo>
+cd poc-graphiti-agent
+
+# 1. Crear .env desde el template
+cp .env.example .env
+# Editar .env con tus keys/passwords (ver opciones abajo)
+
+# 2. Levantar todo (Postgres + Neo4j + Dashboard)
+docker compose up --build -d
+
+# 3. Abrir el dashboard
+# http://localhost:8501
+```
+
+**Correr ingesta u otros comandos CLI dentro del container:**
+```bash
+docker compose exec app python -m poc.run_poc --ingest "documents_to_index" --all
+docker compose exec app python -m poc.hydrate_graph --limit 5
+```
+
+**Conectar a Ollama del host:** El container usa `host.docker.internal` para alcanzar Ollama. Asegurate de que Ollama esté corriendo en el host (`ollama serve`) y que `.env` tenga:
+```
+OPENAI_BASE_URL=http://host.docker.internal:11434/v1
+```
+
+**Parar todo:**
+```bash
+docker compose down          # Mantiene datos
+docker compose down -v       # Borra datos (Postgres + Neo4j)
+```
+
+---
+
+### Opción B — Manual (sin Docker para la app)
+
+#### Requisitos
 - Python 3.10+
 - Docker (para Postgres y Neo4j)
 - (Opcional) [Ollama](https://ollama.com/) para modelos locales
 
-### 1. Clonar e instalar dependencias
+#### 1. Clonar e instalar dependencias
 
 ```bash
 git clone <repo>
@@ -168,33 +208,34 @@ cd poc-graphiti-agent
 pip install -r requirements.txt
 ```
 
-### 2. Levantar los servicios con Docker
+#### 2. Levantar Postgres y Neo4j con Docker
 
 ```bash
-docker-compose up -d
+docker compose up postgres neo4j -d
 ```
 
-### 3. Configurar variables de entorno
+#### 3. Configurar variables de entorno
 
 ```bash
 cp .env.example .env
 ```
 
-Editar `.env` según el proveedor elegido:
+Editar `.env` según el proveedor elegido.
 
-**Opción A — OpenAI (cloud):**
+> **Nota:** En setup manual, cambiar los hosts a `localhost`:
+> - `NEO4J_URI=neo4j://127.0.0.1:7687`
+> - `POSTGRES_HOST=localhost` / `POSTGRES_PORT=5435`
+> - `OPENAI_BASE_URL=http://localhost:11434/v1` (si usás Ollama)
+
+**OpenAI (cloud):**
 ```
 LLM_PROVIDER=openai
 OPENAI_API_KEY=sk-...
 DEFAULT_MODEL=gpt-5-mini
 EMBEDDING_MODEL=text-embedding-3-small
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=password
-POSTGRES_DSN=postgresql://user:password@localhost:5432/graphiti_poc
 ```
 
-**Opción B — Ollama (local, $0 costo):**
+**Ollama (local, $0 costo):**
 ```
 LLM_PROVIDER=ollama
 DEFAULT_MODEL=qwen2.5:3b
@@ -296,7 +337,10 @@ poc-graphiti-agent/
 │   └── neo4j_viewer.py           # Visualizador standalone (Streamlit + Pyvis)
 ├── documents_to_index/           # Documentos .md a ingestar
 ├── logs/                         # CSVs de métricas generados automáticamente
-├── docker-compose.yml
+├── Dockerfile                    # Build multi-stage (Python 3.13-slim)
+├── .dockerignore
+├── docker-compose.yml            # Postgres + Neo4j + App (3 servicios)
+├── .env.example                  # Template de variables de entorno para Docker
 ├── requirements.txt
 └── README.md
 ```

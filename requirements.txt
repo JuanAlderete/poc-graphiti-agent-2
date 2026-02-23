@@ -27,6 +27,7 @@ streamlit>=1.30.0
 plotly>=5.18.0
 nest_asyncio>=1.6.0   # ADDED: fixes asyncio.run inside Streamlit event loop
 pandas>=2.0.0
+pyvis>=0.3.2          # Neo4j graph visualization
 
 # Testing
 pytest==8.4.1

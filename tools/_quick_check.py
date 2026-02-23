@@ -1,6 +1,7 @@
+import neo4j
 from neo4j import GraphDatabase
 
-d = GraphDatabase.driver("neo4j://127.0.0.1:7687", auth=("neo4j", "adminadmin"))
+d = GraphDatabase.driver("neo4j://127.0.0.1:7687", auth=neo4j.basic_auth("neo4j", "adminadmin"))
 s = d.session(database="neo4j")
 
 print("Nodes:", s.run("MATCH (n) RETURN count(n) AS c").single()["c"])

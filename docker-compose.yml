@@ -1,27 +1,30 @@
 services:
+  # ── PostgreSQL + pgvector ──────────────────────────────────────────────
   postgres:
     image: pgvector/pgvector:pg16
     container_name: poc_postgres
+    env_file: .env
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: admin123
-      POSTGRES_DB: graphiti_poc
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin123}
+      POSTGRES_DB: ${POSTGRES_DB:-graphiti_poc}
     ports:
-      - "5435:5432" # Mapped to 5435 as per .env
+      - "5435:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # - ./sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql # Optional auto-init
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d graphiti_poc"]
       interval: 5s
       timeout: 5s
       retries: 5
 
+  # ── Neo4j (Knowledge Graph) ────────────────────────────────────────────
   neo4j:
     image: neo4j:5.26.0
     container_name: poc_neo4j
     environment:
-      NEO4J_AUTH: neo4j/adminadmin
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-adminadmin}
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_apoc_export_file_enabled: "true"
       NEO4J_apoc_import_file_enabled: "true"
@@ -29,8 +32,8 @@ services:
       NEO4J_dbms_memory_heap_initial__size: "512m"
       NEO4J_dbms_memory_heap_max__size: "1G"
     ports:
-      - "7474:7474" # HTTP
-      - "7687:7687" # Bolt
+      - "7474:7474"  # Browser UI
+      - "7687:7687"  # Bolt protocol
     volumes:
       - neo4j_data:/data
     healthcheck:
@@ -38,6 +41,28 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # ── Application (Dashboard + Pipeline) ─────────────────────────────────
+  app:
+    build: .
+    container_name: poc_app
+    env_file: .env
+    ports:
+      - "8501:8501"
+    volumes:
+      # Persist logs between restarts
+      - ./logs:/app/logs
+      # Mount documents so you can add files without rebuilding
+      - ./documents_to_index:/app/documents_to_index
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    # Allow connecting to Ollama running on the host machine
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
 
 volumes:
   postgres_data:

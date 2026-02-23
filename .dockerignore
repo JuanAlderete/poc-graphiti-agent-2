@@ -1,0 +1,43 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment (user secrets)
+.env
+
+# Logs and data (generated at runtime)
+logs/
+*.log
+
+# Docker volumes (no circular copy)
+postgres_data/
+neo4j_data/
+
+# Agents / skills
+.agents/
+
+# Tests
+.pytest_cache/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Misc
+*.md.bak
+tools/diagnostic_output.txt

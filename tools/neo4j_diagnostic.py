@@ -13,6 +13,7 @@ import sys
 sys.stdout.reconfigure(encoding='utf-8')
 
 from dotenv import load_dotenv
+import neo4j
 from neo4j import AsyncGraphDatabase
 
 load_dotenv()
@@ -23,7 +24,7 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "")
 
 
 async def run_diagnostic():
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=neo4j.basic_auth(NEO4J_USER, NEO4J_PASSWORD))
 
     async with driver.session(database="neo4j") as session:
         print("=" * 60)

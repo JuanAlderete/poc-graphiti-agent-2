@@ -11,6 +11,7 @@ import tempfile
 
 import streamlit as st
 from dotenv import load_dotenv
+import neo4j
 from neo4j import GraphDatabase
 from pyvis.network import Network
 
@@ -38,7 +39,7 @@ DEFAULT_EDGE_COLOR = "#90A4AE"
 
 # ── Neo4j queries ────────────────────────────────────────────────────────────
 def get_driver():
-    return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    return GraphDatabase.driver(NEO4J_URI, auth=neo4j.basic_auth(NEO4J_USER, NEO4J_PASSWORD))
 
 
 def get_stats(driver):

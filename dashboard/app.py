@@ -6,6 +6,7 @@ import time
 import nest_asyncio
 import pandas as pd
 import streamlit as st
+import neo4j
 from neo4j import GraphDatabase
 from pyvis.network import Network
 
@@ -520,7 +521,7 @@ def _neo4j_driver():
     uri = _cfg.NEO4J_URI
     user = _cfg.NEO4J_USER
     pwd = _cfg.NEO4J_PASSWORD
-    return GraphDatabase.driver(uri, auth=(user, pwd))
+    return GraphDatabase.driver(uri, auth=neo4j.basic_auth(user, pwd))
 
 
 def _neo4j_query(driver, cypher, **params):
