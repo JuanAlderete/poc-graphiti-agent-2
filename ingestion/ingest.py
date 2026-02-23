@@ -100,7 +100,7 @@ class DocumentIngestionPipeline:
         return cost
 
 
-async def ingest_directory(directory: str, skip_graphiti: bool = False) -> None:
+async def ingest_directory(directory: str, skip_graphiti: bool = False, max_files: int = 0) -> None:
     pipeline = DocumentIngestionPipeline()
     await DatabasePool.init_db()
 
@@ -112,6 +112,10 @@ async def ingest_directory(directory: str, skip_graphiti: bool = False) -> None:
         for f in os.listdir(directory)
         if f.endswith(".md")
     ])
+
+    if max_files > 0:
+        files = files[:max_files]
+        logger.info("Limiting ingestion to %d file(s).", max_files)
 
     if not files:
         logger.warning("No .md files found in '%s'.", directory)

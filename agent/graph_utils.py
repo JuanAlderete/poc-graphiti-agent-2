@@ -10,6 +10,44 @@ from poc.token_tracker import tracker
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Monkey-patch: make resolve_extracted_edges tolerant to invalid UUIDs.
+#
+# Small LLMs (qwen2.5:3b, etc.) sometimes generate edges that reference
+# entity UUIDs that don't exist in the entity list.  The upstream code
+# does a direct dict lookup which crashes with KeyError.  We wrap the
+# original function to filter out those broken edges before processing.
+# ---------------------------------------------------------------------------
+import graphiti_core.utils.maintenance.edge_operations as _edge_ops
+
+_original_resolve = _edge_ops.resolve_extracted_edges
+
+
+async def _patched_resolve_extracted_edges(clients, extracted_edges, episode, entities, edge_types, edge_type_map):
+    uuid_set = {e.uuid for e in entities}
+    valid_edges = []
+    for edge in extracted_edges:
+        if edge.source_node_uuid in uuid_set and edge.target_node_uuid in uuid_set:
+            valid_edges.append(edge)
+        else:
+            logger.warning(
+                "Skipping edge '%s' — references unknown UUID(s): src=%s, tgt=%s",
+                edge.name, edge.source_node_uuid, edge.target_node_uuid,
+            )
+    if not valid_edges:
+        return [], []
+    return await _original_resolve(clients, valid_edges, episode, entities, edge_types, edge_type_map)
+
+
+_edge_ops.resolve_extracted_edges = _patched_resolve_extracted_edges
+
+# Also patch the direct import in graphiti_core.graphiti (it does
+# `from ...edge_operations import resolve_extracted_edges`)
+import graphiti_core.graphiti as _graphiti_mod
+_graphiti_mod.resolve_extracted_edges = _patched_resolve_extracted_edges
+
+logger.debug("Patched resolve_extracted_edges for UUID safety.")
+
 _GRAPHITI_OUTPUT_RATIO = 0.30  # estimacion conservadora de tokens out/in
 
 # Group ID por defecto para que todos los episodios sean recuperables juntos.
@@ -58,6 +96,49 @@ class GraphClient:
                     llm_client=GeminiClient(model_name=settings.DEFAULT_MODEL),
                     embedder=GeminiEmbedder(),
                 )
+            elif provider == "ollama":
+                from graphiti_core.llm_client.config import LLMConfig
+                from graphiti_core.llm_client.openai_client import OpenAIClient
+                from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
+                from openai import AsyncOpenAI
+                import httpx
+
+                base_url = settings.OPENAI_BASE_URL or "http://localhost:11434/v1"
+                logger.info(
+                    "Initializing Graphiti with Ollama (%s) at %s...",
+                    settings.DEFAULT_MODEL, base_url
+                )
+
+                _ollama_timeout = httpx.Timeout(1800.0, connect=30.0)
+                _ollama_llm_client = AsyncOpenAI(
+                    api_key="ollama",
+                    base_url=base_url,
+                    timeout=_ollama_timeout,
+                    max_retries=0,
+                )
+
+                cls._client = Graphiti(
+                    uri=settings.NEO4J_URI,
+                    user=settings.NEO4J_USER,
+                    password=settings.NEO4J_PASSWORD,
+                    llm_client=OpenAIClient(
+                        config=LLMConfig(
+                            api_key="ollama",
+                            model=settings.DEFAULT_MODEL,
+                            small_model=settings.DEFAULT_MODEL,
+                            base_url=base_url,
+                        ),
+                        client=_ollama_llm_client,
+                        max_tokens=16384,
+                    ),
+                    embedder=OpenAIEmbedder(
+                        config=OpenAIEmbedderConfig(
+                            api_key="ollama",
+                            embedding_model=settings.EMBEDDING_MODEL,
+                            base_url=base_url,
+                        )
+                    ),
+                )
             else:
                 from graphiti_core.llm_client.config import LLMConfig
                 from graphiti_core.llm_client.openai_client import OpenAIClient
@@ -87,6 +168,16 @@ class GraphClient:
     def reset(cls) -> None:
         """Reset the singleton so the next call to get_client() re-creates it."""
         cls._client = None
+
+    @classmethod
+    async def clear_graph(cls) -> None:
+        """Delete ALL nodes and relationships from Neo4j."""
+        client = cls.get_client()
+        driver = client.driver
+        async with driver.session(database="neo4j") as session:
+            await session.run("MATCH (n) DETACH DELETE n")
+        logger.info("Cleared all Neo4j nodes and relationships.")
+        cls.reset()
 
     @classmethod
     def _build_client(cls) -> Graphiti:

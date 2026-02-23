@@ -2,8 +2,6 @@ import asyncio
 import logging
 from functools import lru_cache
 from typing import Dict, List, Tuple
-
-import google.generativeai as genai
 from openai import AsyncOpenAI, RateLimitError
 
 from agent.config import settings
@@ -22,7 +20,13 @@ class EmbeddingGenerator:
 
         if self.provider == "openai":
             self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        elif self.provider == "ollama":
+            self.client = AsyncOpenAI(
+                api_key="ollama",
+                base_url=settings.OPENAI_BASE_URL or "http://localhost:11434/v1",
+            )
         elif self.provider == "gemini":
+            import google.generativeai as genai
             genai.configure(api_key=settings.GEMINI_API_KEY)
             self.client = None
         else:
@@ -91,6 +95,7 @@ class EmbeddingGenerator:
             raise
 
     async def _embed_gemini_single(self, text: str) -> Tuple[List[float], int]:
+        import google.generativeai as genai
         def _call():
             return genai.embed_content(
                 model=f"models/{self.model}",
@@ -103,6 +108,7 @@ class EmbeddingGenerator:
     async def _embed_gemini_batch(
         self, texts: List[str]
     ) -> Tuple[List[List[float]], int]:
+        import google.generativeai as genai
         def _call():
             return genai.embed_content(
                 model=f"models/{self.model}",

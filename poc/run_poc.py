@@ -26,12 +26,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def run_ingestion(directory: str, skip_graphiti: bool = False) -> None:
+async def run_ingestion(directory: str, skip_graphiti: bool = False, max_files: int = 0) -> None:
     logger.info("Starting ingestion from '%s' (skip_graphiti=%s)…", directory, skip_graphiti)
-    # FIXED: no llamamos ensure_schema() aquí — ingest_directory() ya lo hace
-    # internamente cuando skip_graphiti=False. ensure_initialized() es idempotente
-    # pero quitamos la llamada redundante para mayor claridad.
-    await ingest_directory(directory, skip_graphiti=skip_graphiti)
+    await ingest_directory(directory, skip_graphiti=skip_graphiti, max_files=max_files)
     logger.info("Ingestion complete.")
 
 
@@ -179,6 +176,7 @@ async def _main() -> None:
     parser.add_argument("--generate-structured", action="store_true", help="Run generation with structured agents")
     parser.add_argument("--formato", type=str, default="reel_cta", help="Format for structured generation: reel_cta|historia|email|reel_lead_magnet|ads")
     parser.add_argument("--topic", type=str, default="Validación de ideas de negocio", help="Topic for structured generation")
+    parser.add_argument("--max-files", type=int, default=0, help="Max files to ingest (0 = all)")
 
     args = parser.parse_args()
 
@@ -198,14 +196,14 @@ async def _main() -> None:
         from agent.db_utils import DatabasePool
         logger.info("Clearing Postgres database…")
         await DatabasePool.clear_database()
-        # También resetear el cliente Graphiti para que reinicialice los índices
-        GraphClient.reset()
+        logger.info("Clearing Neo4j graph…")
+        await GraphClient.clear_graph()
 
     # ── Ingesta ───────────────────────────────────────────────────────────────
     # FIXED: la lógica anterior tenía un elif anidado que nunca se ejecutaba
     ingest_dir = args.ingest
     if (args.ingest or args.all) and ingest_dir:
-        await run_ingestion(ingest_dir, skip_graphiti=args.skip_graphiti)
+        await run_ingestion(ingest_dir, skip_graphiti=args.skip_graphiti, max_files=args.max_files)
     elif args.all and not ingest_dir:
         logger.info("--all activado sin --ingest: saltando ingesta (no hay directorio).")
 

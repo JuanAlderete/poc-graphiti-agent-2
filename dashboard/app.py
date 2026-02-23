@@ -1,10 +1,13 @@
 import asyncio
 import os
+import tempfile
 import time
 
 import nest_asyncio
 import pandas as pd
 import streamlit as st
+from neo4j import GraphDatabase
+from pyvis.network import Network
 
 # FIXED: patch the event loop so asyncio.run / await work inside Streamlit
 nest_asyncio.apply()
@@ -92,13 +95,14 @@ with st.sidebar:
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_ingest, tab_kb, tab_search, tab_gen, tab_analytics, tab_projections = st.tabs([
+tab_ingest, tab_kb, tab_search, tab_gen, tab_analytics, tab_projections, tab_neo4j = st.tabs([
     "📥 Ingestion",
     "🧠 Knowledge Base",
     "🔍 Search",
     "✨ Generation",
     "📊 Analytics",
     "📈 Proyecciones",
+    "🔵 Neo4j Graph",
 ])
 
 
@@ -169,7 +173,7 @@ with tab_kb:
                     "filepath": st.column_config.TextColumn("File Path"),
                     "title": st.column_config.TextColumn("Title"),
                 },
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
     except Exception as e:
@@ -392,7 +396,7 @@ with tab_analytics:
 
     with log1:
         if not df_ingest.empty:
-            st.dataframe(df_ingest, use_container_width=True)
+            st.dataframe(df_ingest, width="stretch")
             if "tiempo_seg" in df_ingest.columns and "nombre_archivo" in df_ingest.columns:
                 st.bar_chart(df_ingest.set_index("nombre_archivo")["tiempo_seg"])
         else:
@@ -400,7 +404,7 @@ with tab_analytics:
 
     with log2:
         if not df_search.empty:
-            st.dataframe(df_search, use_container_width=True)
+            st.dataframe(df_search, width="stretch")
             if "latencia_ms" in df_search.columns and "tipo_busqueda" in df_search.columns:
                 st.bar_chart(df_search.groupby("tipo_busqueda")["latencia_ms"].mean())
         else:
@@ -408,7 +412,7 @@ with tab_analytics:
 
     with log3:
         if not df_gen.empty:
-            st.dataframe(df_gen, use_container_width=True)
+            st.dataframe(df_gen, width="stretch")
             if "tokens_out" in df_gen.columns and "tiempo_seg" in df_gen.columns:
                 st.scatter_chart(df_gen, x="tokens_out", y="tiempo_seg", color="modelo")
         else:
@@ -500,3 +504,211 @@ with tab_projections:
                 "source": "from logs" if not df_ingest.empty else "default estimates",
             }
         )
+
+
+# ── TAB 7: NEO4J GRAPH EXPLORER ─────────────────────────────────────────────
+_NEO4J_LABEL_COLORS = {
+    "Entity": "#4FC3F7",
+    "Episodic": "#FF8A65",
+    "Community": "#AED581",
+}
+_NEO4J_DEFAULT_COLOR = "#B0BEC5"
+
+
+def _neo4j_driver():
+    from agent.config import settings as _cfg
+    uri = _cfg.NEO4J_URI
+    user = _cfg.NEO4J_USER
+    pwd = _cfg.NEO4J_PASSWORD
+    return GraphDatabase.driver(uri, auth=(user, pwd))
+
+
+def _neo4j_query(driver, cypher, **params):
+    with driver.session(database="neo4j") as s:
+        return s.run(cypher, **params).data()
+
+
+def _neo4j_single(driver, cypher):
+    with driver.session(database="neo4j") as s:
+        return s.run(cypher).single()
+
+
+with tab_neo4j:
+    st.header("Neo4j Graph Explorer")
+    neo4j_uri = os.getenv("NEO4J_URI", "neo4j://127.0.0.1:7687")
+    st.caption(f"Connected to: `{neo4j_uri}`")
+
+    try:
+        _driver = _neo4j_driver()
+        _driver.verify_connectivity()
+    except Exception as exc:
+        st.error(f"Cannot connect to Neo4j: {exc}")
+        _driver = None
+
+    if _driver:
+        # ── Stats row ────────────────────────────────────────────────────
+        n_nodes = _neo4j_single(_driver, "MATCH (n) RETURN count(n) AS c")["c"]
+        n_rels = _neo4j_single(_driver, "MATCH ()-[r]->() RETURN count(r) AS c")["c"]
+        lbl_data = _neo4j_query(_driver,
+            "MATCH (n) UNWIND labels(n) AS label "
+            "RETURN label, count(*) AS count ORDER BY count DESC")
+        n_episodes = next((l["count"] for l in lbl_data if l["label"] == "Episodic"), 0)
+
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("Nodes", n_nodes)
+        sc2.metric("Relationships", n_rels)
+        sc3.metric("Episodes", n_episodes)
+        sc4.metric("Entity Types", next((l["count"] for l in lbl_data if l["label"] == "Entity"), 0))
+
+        # ── Sub-tabs ─────────────────────────────────────────────────────
+        neo_tab_graph, neo_tab_episodes, neo_tab_details, neo_tab_query = st.tabs(
+            ["Interactive Graph", "Episodes", "Details", "Cypher Query"]
+        )
+
+        # ── Interactive Graph ────────────────────────────────────────────
+        with neo_tab_graph:
+            gcol1, gcol2 = st.columns([1, 4])
+            with gcol1:
+                label_options = ["All"] + [l["label"] for l in lbl_data]
+                lbl_filter = st.selectbox("Filter by label", label_options, key="neo_lbl")
+                max_nodes = st.slider("Max nodes", 10, 500, 100, key="neo_max")
+                physics_on = st.checkbox("Physics", True, key="neo_phys")
+
+            with gcol2:
+                if n_nodes == 0:
+                    st.warning("No nodes in database.")
+                else:
+                    with st.spinner("Building graph..."):
+                        # Fetch nodes
+                        if lbl_filter != "All":
+                            nodes_q = f"MATCH (n:{lbl_filter}) RETURN n, labels(n) AS labels LIMIT $lim"
+                        else:
+                            nodes_q = "MATCH (n) RETURN n, labels(n) AS labels LIMIT $lim"
+                        raw_nodes = _neo4j_query(_driver, nodes_q, lim=max_nodes)
+
+                        # Fetch rels
+                        rels_q = (
+                            "MATCH (a)-[r]->(b) "
+                            "RETURN a.uuid AS a_uuid, a.name AS a_name, labels(a) AS a_labels, "
+                            "       b.uuid AS b_uuid, b.name AS b_name, labels(b) AS b_labels, "
+                            "       type(r) AS rel_type, properties(r) AS rel_props "
+                            "LIMIT $lim"
+                        )
+                        raw_rels = _neo4j_query(_driver, rels_q, lim=max_nodes * 2)
+
+                        # Build pyvis
+                        net = Network(
+                            height="650px", width="100%",
+                            bgcolor="#1a1a2e", font_color="white",
+                            directed=True, notebook=False,
+                        )
+                        if physics_on:
+                            net.force_atlas_2based(
+                                gravity=-50, central_gravity=0.01,
+                                spring_length=150, spring_strength=0.08, damping=0.4,
+                            )
+                        else:
+                            net.toggle_physics(False)
+
+                        seen = set()
+
+                        def _add_node(nid, name, labels_list):
+                            if nid in seen:
+                                return
+                            seen.add(nid)
+                            pl = labels_list[0] if labels_list else "Unknown"
+                            color = _NEO4J_LABEL_COLORS.get(pl, _NEO4J_DEFAULT_COLOR)
+                            sz = 25 if pl == "Episodic" else 18
+                            net.add_node(
+                                nid, label=str(name or "?")[:30],
+                                title=f"<b>{name}</b><br>Label: {pl}",
+                                color=color, size=sz,
+                                font={"size": 12, "color": "white"},
+                            )
+
+                        # Add nodes from rels
+                        for r in raw_rels:
+                            a_id = r["a_uuid"] or r["a_name"] or "a?"
+                            b_id = r["b_uuid"] or r["b_name"] or "b?"
+                            _add_node(a_id, r["a_name"], r["a_labels"])
+                            _add_node(b_id, r["b_name"], r["b_labels"])
+
+                            props = r.get("rel_props") or {}
+                            fact = str(props.get("fact", ""))[:200]
+                            title = f"<b>{r['rel_type']}</b>"
+                            if fact:
+                                title += f"<br>{fact}"
+
+                            net.add_edge(
+                                a_id, b_id,
+                                title=title,
+                                label=r["rel_type"][:20],
+                                color="#78909C", arrows="to",
+                                font={"size": 8, "color": "#aaa"},
+                            )
+
+                        # Add standalone nodes
+                        for rec in raw_nodes:
+                            n = rec["n"]
+                            nid = n.get("uuid") or n.get("name") or str(id(n))
+                            _add_node(nid, n.get("name"), rec["labels"])
+
+                        # Render
+                        with tempfile.NamedTemporaryFile(
+                            delete=False, suffix=".html", mode="w", encoding="utf-8"
+                        ) as tmp:
+                            net.save_graph(tmp.name)
+                            with open(tmp.name, "r", encoding="utf-8") as fh:
+                                html = fh.read()
+                            st.components.v1.html(html, height=680, scrolling=False)
+
+                        st.caption(f"Showing {len(seen)} nodes, {len(raw_rels)} relationships")
+
+        # ── Episodes ─────────────────────────────────────────────────────
+        with neo_tab_episodes:
+            eps = _neo4j_query(_driver,
+                "MATCH (e) WHERE 'Episodic' IN labels(e) "
+                "RETURN e.name AS name, e.created_at AS created, "
+                "e.group_id AS group_id, e.source_description AS source "
+                "ORDER BY e.created_at")
+            if eps:
+                st.subheader(f"Ingested Episodes ({len(eps)})")
+                for ep in eps:
+                    with st.expander(ep.get("name") or "unnamed"):
+                        st.json(ep)
+            else:
+                st.info("No episodic nodes found.")
+
+        # ── Details ──────────────────────────────────────────────────────
+        with neo_tab_details:
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                st.subheader("Node Labels")
+                for l in lbl_data:
+                    clr = _NEO4J_LABEL_COLORS.get(l["label"], _NEO4J_DEFAULT_COLOR)
+                    st.markdown(
+                        f'<span style="color:{clr};font-weight:600">{l["label"]}</span>: {l["count"]}',
+                        unsafe_allow_html=True)
+            with dc2:
+                st.subheader("Relationship Types")
+                rel_types = _neo4j_query(_driver,
+                    "MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count ORDER BY count DESC")
+                for rt in rel_types:
+                    st.markdown(f'`{rt["type"]}`: {rt["count"]}')
+
+        # ── Custom Query ─────────────────────────────────────────────────
+        with neo_tab_query:
+            st.subheader("Run Cypher Query")
+            default_cypher = "MATCH (n) RETURN n.name AS name, labels(n) AS labels LIMIT 25"
+            cypher = st.text_area("Cypher", value=default_cypher, height=100, key="neo_cypher")
+            if st.button("Execute", key="neo_exec"):
+                try:
+                    result = _neo4j_query(_driver, cypher)
+                    if result:
+                        st.dataframe(result, width="stretch")
+                    else:
+                        st.info("Query returned no results.")
+                except Exception as qe:
+                    st.error(f"Query error: {qe}")
+
+        _driver.close()

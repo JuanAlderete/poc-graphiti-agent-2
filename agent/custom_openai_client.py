@@ -30,7 +30,7 @@ class OptimizedOpenAIClient(LLMClient):
         max_delay: float = 60.0,
         temperature: float = 0.1,
     ):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or "ollama"
         if not self.api_key:
             raise ValueError("OPENAI_API_KEY not found")
         
@@ -39,13 +39,17 @@ class OptimizedOpenAIClient(LLMClient):
         self.base_delay = base_delay
         self.max_delay = max_delay
         self.temperature = temperature
-        
-        # Reutilizar el cliente HTTP con connection pooling
-        self._client = AsyncOpenAI(
-            api_key=self.api_key,
-            timeout=60.0,
-            max_retries=0,  # Manejamos nosotros los retries
-        )
+
+        client_kwargs = {
+            "api_key": self.api_key,
+            "timeout": 60.0,
+            "max_retries": 0,
+        }
+        base_url = os.getenv("OPENAI_BASE_URL")
+        if base_url:
+            client_kwargs["base_url"] = base_url
+
+        self._client = AsyncOpenAI(**client_kwargs)
         
         # Semáforo para limitar concurrencia
         self._semaphore = None  # Se inicializará en setup

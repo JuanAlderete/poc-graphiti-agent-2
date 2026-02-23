@@ -77,7 +77,8 @@ Documentos (.md)
 - **PostgreSQL** con extensión `pgvector` para búsqueda vectorial
 - **Neo4j** como base de datos del knowledge graph
 - **Graphiti** (`graphiti-core`) para extracción automática de entidades y relaciones
-- **OpenAI** o **Gemini** como proveedor de LLM y embeddings (configurable)
+- **OpenAI**, **Gemini** u **Ollama** como proveedor de LLM y embeddings (configurable)
+- **Streamlit** + **Pyvis** para dashboard interactivo y visualización de grafos
 
 ---
 
@@ -157,6 +158,7 @@ python -m poc.hydrate_graph --reset-flags
 ### Requisitos
 - Python 3.10+
 - Docker (para Postgres y Neo4j)
+- (Opcional) [Ollama](https://ollama.com/) para modelos locales
 
 ### 1. Clonar e instalar dependencias
 
@@ -178,17 +180,34 @@ docker-compose up -d
 cp .env.example .env
 ```
 
-Editar `.env`:
+Editar `.env` según el proveedor elegido:
+
+**Opción A — OpenAI (cloud):**
 ```
+LLM_PROVIDER=openai
 OPENAI_API_KEY=sk-...
 DEFAULT_MODEL=gpt-5-mini
 EMBEDDING_MODEL=text-embedding-3-small
-LLM_PROVIDER=openai
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=password
 POSTGRES_DSN=postgresql://user:password@localhost:5432/graphiti_poc
 ```
+
+**Opción B — Ollama (local, $0 costo):**
+```
+LLM_PROVIDER=ollama
+DEFAULT_MODEL=qwen2.5:3b
+EMBEDDING_MODEL=nomic-embed-text
+OPENAI_BASE_URL=http://localhost:11434/v1
+OPENAI_API_KEY=ollama
+NEO4J_URI=neo4j://127.0.0.1:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=adminadmin
+POSTGRES_DSN=postgresql://user:password@localhost:5432/graphiti_poc
+```
+
+> **Nota Ollama:** Los modelos `qwen2.5:3b` y `nomic-embed-text` se descargan automáticamente si no están instalados. El sistema configura automáticamente `small_model` para evitar que Graphiti intente usar `gpt-4.1-nano` y se pasa un timeout extendido (1800s) al cliente OpenAI para tolerar los tiempos de respuesta de modelos locales.
 
 ---
 
@@ -200,10 +219,18 @@ POSTGRES_DSN=postgresql://user:password@localhost:5432/graphiti_poc
 python -m poc.run_poc --clear-logs --clear-db --ingest "documents_to_index" --all
 ```
 
+> `--clear-db` ahora limpia **tanto Postgres como Neo4j** (nodos, relaciones e índices).
+
 ### Solo ingesta vectorial (sin Graphiti, más rápido y barato)
 
 ```bash
 python -m poc.run_poc --ingest documents_to_index/ --skip-graphiti
+```
+
+### Ingesta limitada (para pruebas rápidas)
+
+```bash
+python -m poc.run_poc --ingest "documents_to_index" --max-files 2 --all
 ```
 
 ### Solo búsquedas de prueba
@@ -224,6 +251,14 @@ python -m poc.run_poc --generate
 python -m poc.hydrate_graph --limit 5
 ```
 
+### Dashboard interactivo
+
+```bash
+python -m streamlit run dashboard/app.py
+```
+
+El dashboard incluye 7 tabs: Ingestion, Knowledge Base, Search, Generation, Analytics, Proyecciones y **Neo4j Graph** (ver sección 12).
+
 ---
 
 ## Estructura de archivos explicada
@@ -235,24 +270,30 @@ poc-graphiti-agent/
 │   ├── custom_openai_client.py   # Cliente OpenAI con fixes para gpt-5-mini y retry
 │   ├── db_utils.py               # Pool de conexiones Postgres + queries
 │   ├── gemini_client.py          # Cliente Gemini para Graphiti
-│   ├── graph_utils.py            # Wrapper Graphiti/Neo4j
+│   ├── graph_utils.py            # Wrapper Graphiti/Neo4j + monkey-patch UUID safety
 │   ├── models.py                 # Modelos Pydantic (SearchResult, etc.)
 │   └── tools.py                  # Herramientas de búsqueda (vector/graph/hybrid)
+├── dashboard/
+│   ├── app.py                    # Dashboard Streamlit (7 tabs incluido Neo4j Graph)
+│   └── utils.py                  # Utilidades del dashboard
 ├── ingestion/
 │   ├── chunker.py                # RecursiveChunker (chunk_size=800, overlap=100)
-│   ├── embedder.py               # EmbeddingGenerator con cache de queries
+│   ├── embedder.py               # EmbeddingGenerator con cache (soporta Ollama)
 │   └── ingest.py                 # Pipeline completo de ingesta
 ├── poc/
 │   ├── check_system.py           # Health check pre-vuelo
-│   ├── config.py                 # Precios de modelos para tracking de costos
+│   ├── config.py                 # Precios de modelos + defaults Ollama
 │   ├── content_generator.py      # Generador de contenido con límites de tokens
 │   ├── cost_calculator.py        # Calcula costo USD por operación
 │   ├── hydrate_graph.py          # Migración secuencial Postgres -> Neo4j
 │   ├── logging_utils.py          # Loggers CSV por tipo de operación
 │   ├── prompts/                  # Templates por formato (email, reel, historia)
 │   ├── queries.py                # 20 queries de prueba (vector/graph/hybrid)
-│   ├── run_poc.py                # Entrypoint principal
+│   ├── run_poc.py                # Entrypoint principal (--max-files, --clear-db)
 │   └── token_tracker.py          # Singleton de tracking de tokens y costos
+├── tools/
+│   ├── neo4j_diagnostic.py       # Script de diagnóstico Neo4j (conteo, labels, edges)
+│   └── neo4j_viewer.py           # Visualizador standalone (Streamlit + Pyvis)
 ├── documents_to_index/           # Documentos .md a ingestar
 ├── logs/                         # CSVs de métricas generados automáticamente
 ├── docker-compose.yml
@@ -361,6 +402,25 @@ El log lo confirmaba: `reasoning_tokens=2048` en cada intento fallido.
 - Se agregó `get_all_episodes(group_ids=None)` que usa `client.get_episodes()` para recuperar episodios de **todos** los grupos.
 - Se agregaron métodos `reset()` y `_build_client()` requeridos por `run_poc.py` y `check_system.py`.
 - `hydrate_graph.py` fue actualizado para usar `GraphClient` en lugar de `GraphManager`.
+
+---
+
+#### BUG 7: KeyError en resolve_extracted_edges con LLMs pequeños — `graph_utils.py`
+**Síntoma:** La ingesta de ciertos documentos (ej. `lucas.md`) fallaba con:
+```
+KeyError: '78edfb08-3cab-4fb4-a9fb-5a88af334189'
+```
+en `graphiti_core/utils/maintenance/edge_operations.py` línea 317.
+
+**Causa raíz:** Modelos pequeños como `qwen2.5:3b` a veces generan edges (relaciones) que referencian UUIDs de entidades que no existen en la lista de entidades extraídas. El código upstream de Graphiti hace un `dict[uuid]` directo sin verificar si el UUID existe, causando un `KeyError` que aborta la ingesta completa del documento.
+
+**Fix:** Se implementó un **monkey-patch** en `agent/graph_utils.py` que intercepta `resolve_extracted_edges` antes de que procese los edges:
+1. Construye un set de UUIDs válidos desde la lista de entidades.
+2. Filtra los edges, descartando aquellos con `source_node_uuid` o `target_node_uuid` inexistentes.
+3. Loggea un `WARNING` por cada edge descartado.
+4. Pasa solo los edges válidos a la función original.
+
+El patch se aplica tanto al módulo `edge_operations` como al import directo en `graphiti_core.graphiti` (que usa `from ... import resolve_extracted_edges`). El documento se ingesta correctamente aunque pierde algunos edges que el LLM generó incorrectamente.
 
 ---
 
@@ -510,3 +570,61 @@ Query del usuario
 **Cuándo usar `hybrid_real`:** Cuando la query es relacional ("qué dijo X sobre Y", "qué documentos hablan de Z"). Para queries semánticas directas, `hybrid` sigue siendo más rápido.
 
 **Fallback automático:** Si Neo4j no retorna resultados, el motor cae automáticamente a búsqueda vectorial.
+
+---
+
+## 13. Soporte Ollama (Modelos Locales)
+
+El sistema puede correr 100% local usando [Ollama](https://ollama.com/), eliminando costos de API. Para activarlo:
+
+1. Instalar Ollama y descargar los modelos:
+   ```bash
+   ollama pull qwen2.5:3b
+   ollama pull nomic-embed-text
+   ```
+
+2. Configurar `.env` con `LLM_PROVIDER=ollama` (ver sección Instalación).
+
+### Archivos modificados para Ollama
+
+| Archivo | Cambio |
+|---|---|
+| `poc/config.py` | Validador `_resolve_gemini_defaults` extendido para detectar `ollama` y setear defaults (`qwen2.5:3b`, `nomic-embed-text`, `http://localhost:11434/v1`). Precios de modelos Ollama agregados como `$0.0`. |
+| `agent/graph_utils.py` | Branch `elif provider == "ollama"` en `get_client()` que configura `OpenAIClient` y `OpenAIEmbedder` con la URL de Ollama. Se pasa `small_model=settings.DEFAULT_MODEL` a `LLMConfig` para evitar que Graphiti use `gpt-4.1-nano`. Timeout del cliente extendido a 1800s. |
+| `ingestion/embedder.py` | Soporte Ollama en `Embedder.__init__()` configurando `AsyncOpenAI` con `base_url` de Ollama. |
+| `agent/db_utils.py` | Detección de dimensión de embedding: 768 para Ollama/Gemini (nomic-embed-text), 1536 para OpenAI. Auto-recreación del schema si las dimensiones no coinciden. |
+| `agent/custom_openai_client.py` | `base_url` configurable desde `OPENAI_BASE_URL` env var para redirigir a Ollama. |
+
+### Limitaciones conocidas con Ollama
+
+- **Velocidad:** Modelos locales son ~10-50x más lentos que APIs cloud. Una ingesta de 5 documentos puede tomar ~15-20 minutos.
+- **Calidad de edges:** `qwen2.5:3b` genera UUIDs inconsistentes en ~10-20% de los documentos. El monkey-patch (BUG 7) mitiga esto saltando edges rotos.
+- **Max tokens:** El modelo puede exceder el límite de `max_tokens=16384`, causando retries. Esto es normal y el sistema reintenta automáticamente.
+
+---
+
+## 14. Neo4j Graph Explorer (Dashboard Tab)
+
+El tab **🔵 Neo4j Graph** en el dashboard provee una interfaz completa para explorar el knowledge graph:
+
+### Métricas
+- Conteo de nodos, relaciones, episodios y entidades.
+
+### Sub-tabs
+
+| Sub-tab | Qué muestra |
+|---|---|
+| **Interactive Graph** | Grafo interactivo con [Pyvis](https://pyvis.readthedocs.io/). Nodos coloreados por label (Entity=azul, Episodic=naranja, Community=verde). Filtro por label, slider de max nodos, toggle de physics. |
+| **Episodes** | Lista de documentos ingresados con metadata (nombre, fecha de creación, group_id, source_description). |
+| **Details** | Breakdown de labels de nodos y tipos de relación con conteos. |
+| **Cypher Query** | Permite ejecutar cualquier query Cypher directo contra Neo4j. Resultados en tabla interactiva. |
+
+### Herramientas de diagnóstico (CLI)
+
+```bash
+# Diagnóstico completo (nodos, labels, episodios, entidades, edges)
+python tools/neo4j_diagnostic.py
+
+# Quick check (conteos básicos)
+python tools/_quick_check.py
+```

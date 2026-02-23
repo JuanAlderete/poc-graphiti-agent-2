@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional
 
 class AppConfig(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
@@ -26,6 +27,7 @@ class AppConfig(BaseSettings):
     # Models — defaults are for OpenAI; Gemini overrides handled via validator
     DEFAULT_MODEL: str = Field(default="gpt-5-mini")
     EMBEDDING_MODEL: str = Field(default="text-embedding-3-small")
+    OPENAI_BASE_URL: Optional[str] = Field(default=None, description="Override OpenAI API base URL")
 
     # Budget Control (Tarea 4)
     MONTHLY_BUDGET_USD: float = Field(
@@ -52,6 +54,13 @@ class AppConfig(BaseSettings):
                 object.__setattr__(self, "DEFAULT_MODEL", "gemini-1.5-flash")
             if self.EMBEDDING_MODEL == "text-embedding-3-small":
                 object.__setattr__(self, "EMBEDDING_MODEL", "text-embedding-004")
+        if self.LLM_PROVIDER.lower() == "ollama":
+            if self.DEFAULT_MODEL == "gpt-5-mini":
+                object.__setattr__(self, "DEFAULT_MODEL", "llama3.1:8b")
+            if self.EMBEDDING_MODEL == "text-embedding-3-small":
+                object.__setattr__(self, "EMBEDDING_MODEL", "nomic-embed-text")
+            if not self.OPENAI_BASE_URL:
+                object.__setattr__(self, "OPENAI_BASE_URL", "http://localhost:11434/v1")
         return self
 
 
@@ -62,6 +71,8 @@ if config.OPENAI_API_KEY:
     os.environ.setdefault("OPENAI_API_KEY", config.OPENAI_API_KEY)
 if config.GEMINI_API_KEY:
     os.environ.setdefault("GEMINI_API_KEY", config.GEMINI_API_KEY)
+if config.OPENAI_BASE_URL:
+    os.environ.setdefault("OPENAI_BASE_URL", config.OPENAI_BASE_URL)
 
 # Module-level shortcuts kept for backwards compat
 DEFAULT_MODEL: str = config.DEFAULT_MODEL
@@ -93,4 +104,8 @@ MODEL_PRICING: dict[str, ModelPricing] = {
     "gemini-1.5-flash":         ModelPricing(0.075, 0.30),
     "gemini-1.5-pro":           ModelPricing(3.50,  10.50),
     "text-embedding-004":       ModelPricing(0.025, 0.0),
+    # Ollama (local — cost is effectively $0, but tracked for consistency)
+    "qwen2.5:3b":               ModelPricing(0.0, 0.0),
+    "llama3.1:8b":              ModelPricing(0.0, 0.0),
+    "nomic-embed-text":          ModelPricing(0.0, 0.0),
 }

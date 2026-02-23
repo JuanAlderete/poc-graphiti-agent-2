@@ -59,8 +59,11 @@ class DatabasePool:
     async def clear_database(cls) -> None:
         pool = await cls.get_pool()
         async with pool.acquire() as conn:
-            await conn.execute("TRUNCATE TABLE chunks, documents CASCADE;")
-            logger.info("Cleared documents + chunks.")
+            # DROP instead of TRUNCATE so init_db() can recreate with correct vector dimension
+            await conn.execute("DROP TABLE IF EXISTS chunks CASCADE;")
+            await conn.execute("DROP TABLE IF EXISTS documents CASCADE;")
+            await conn.execute("DROP VIEW IF EXISTS v_document_summary CASCADE;")
+            logger.info("Dropped documents + chunks tables (will recreate on next init).")
 
     @classmethod
     async def init_db(cls) -> None:
@@ -71,6 +74,7 @@ class DatabasePool:
 
             expected_dim = 768 if (
                 "gemini" in settings.LLM_PROVIDER.lower()
+                or "ollama" in settings.LLM_PROVIDER.lower()
                 or "004" in settings.EMBEDDING_MODEL
             ) else 1536
 
@@ -78,6 +82,23 @@ class DatabasePool:
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
                 "WHERE table_schema='public' AND table_name='chunks')"
             )
+
+            # If table exists, check if vector dimension matches current provider
+            if table_exists:
+                current_dim = await conn.fetchval(
+                    "SELECT atttypmod FROM pg_attribute "
+                    "WHERE attrelid = 'chunks'::regclass AND attname = 'embedding'"
+                )
+                if current_dim and current_dim != expected_dim:
+                    logger.warning(
+                        "Vector dimension mismatch: table has %d, provider needs %d. "
+                        "Recreating schema...", current_dim, expected_dim
+                    )
+                    await conn.execute("DROP TABLE IF EXISTS chunks CASCADE;")
+                    await conn.execute("DROP TABLE IF EXISTS documents CASCADE;")
+                    await conn.execute("DROP VIEW IF EXISTS v_document_summary CASCADE;")
+                    table_exists = False
+
             if not table_exists:
                 with open("sql/schema.sql", encoding="utf-8") as fh:
                     sql = fh.read()
