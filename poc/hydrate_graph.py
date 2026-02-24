@@ -49,14 +49,25 @@ async def hydrate_graph(
 
             logger.info("Processing document: %s", doc_name)
 
-            await GraphClient.add_episode(
+            ep_uuid = await GraphClient.add_episode(
                 content=content,
                 source_reference=doc_name,
                 source_description=f"Document from {md_file.name}",
                 group_id=group_id,
             )
 
-            logger.info("Successfully added episode: %s", doc_name)
+            # Sync metadata back to Postgres if the document exists there
+            from agent.db_utils import get_db_connection, mark_document_graph_ingested
+            async with get_db_connection() as conn:
+                doc_record = await conn.fetchrow(
+                    "SELECT id FROM documents WHERE source = $1 OR source = $2",
+                    md_file.name, doc_name
+                )
+                if doc_record:
+                    await mark_document_graph_ingested(str(doc_record["id"]), ep_uuid)
+                    logger.info("Synced metadata to Postgres for: %s", doc_name)
+
+            logger.info("Successfully added episode: %s (UUID: %s)", doc_name, ep_uuid)
 
             if delay > 0:
                 await asyncio.sleep(delay)

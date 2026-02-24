@@ -50,6 +50,9 @@ class DocumentIngestionPipeline:
             embeddings, embed_tokens = await self.embedder.generate_embeddings_batch(chunks)
             tracker.record_usage(op_id, embed_tokens, 0, settings.EMBEDDING_MODEL, "embedding_api")
 
+            # 2.1 Calcular tokens por chunk para persistencia en DB
+            chunk_token_counts = [tracker.estimate_tokens(c) for c in chunks]
+
             # 3. Postgres — documento
             doc_id = await insert_document(
                 title=filename,
@@ -58,13 +61,16 @@ class DocumentIngestionPipeline:
                 metadata={"source_type": "markdown", "filename": filename},
             )
 
-            # 4. Postgres — chunks con embeddings
-            await insert_chunks(doc_id, chunks, embeddings)
+            # 4. Postgres — chunks con embeddings y tokens
+            await insert_chunks(doc_id, chunks, embeddings, token_counts=chunk_token_counts)
 
             # 5. Graphiti (si está activo)
             # El contenido se limpia y trunca dentro de GraphClient.add_episode()
             if not skip_graphiti:
-                await GraphClient.add_episode(content, filename)
+                from agent.db_utils import mark_document_graph_ingested
+                ep_uuid = await GraphClient.add_episode(content, filename)
+                # Vincular el ID del episodio de Neo4j al documento de Postgres
+                await mark_document_graph_ingested(doc_id, ep_uuid)
 
             latency = time.time() - start_time
             metrics = tracker.end_operation(op_id)

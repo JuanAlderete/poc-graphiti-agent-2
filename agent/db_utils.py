@@ -150,12 +150,13 @@ async def insert_document(
     source: str,
     content: str,
     metadata: dict | None = None,
+    graphiti_episode_id: str | None = None,
 ) -> str:
     async with get_db_connection() as conn:
         doc_id = await conn.fetchval(
-            "INSERT INTO documents (title, source, content, metadata) "
-            "VALUES ($1, $2, $3, $4) RETURNING id",
-            title, source, content, json.dumps(metadata or {}),
+            "INSERT INTO documents (title, source, content, metadata, graphiti_episode_id) "
+            "VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            title, source, content, json.dumps(metadata or {}), graphiti_episode_id,
         )
         return str(doc_id)
 
@@ -166,11 +167,12 @@ async def insert_chunks(
     embeddings: List[List[float]],
     start_index: int = 0,
     chunk_metas: List[Dict[str, Any]] | None = None,
+    token_counts: List[int] | None = None,
 ) -> None:
     """
     Inserta chunks con embeddings.
     `chunk_metas`: lista de dicts (uno por chunk) con metadata enriquecida.
-    Si se omite, cada chunk lleva metadata vacía.
+    `token_counts`: lista de integers con el conteo de tokens por chunk.
     """
     metas = chunk_metas or [{}] * len(chunks)
     async with get_db_connection() as conn:
@@ -181,12 +183,13 @@ async def insert_chunks(
                 _fmt_vec(embedding),
                 start_index + i,
                 json.dumps(metas[i] if i < len(metas) else {}),
+                token_counts[i] if token_counts and i < len(token_counts) else 0,
             )
             for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings))
         ]
         await conn.executemany(
-            "INSERT INTO chunks (document_id, content, embedding, chunk_index, metadata) "
-            "VALUES ($1::uuid, $2, $3::vector, $4, $5::jsonb)",
+            "INSERT INTO chunks (document_id, content, embedding, chunk_index, metadata, token_count) "
+            "VALUES ($1::uuid, $2, $3::vector, $4, $5::jsonb, $6)",
             data,
         )
 
@@ -264,7 +267,7 @@ async def get_documents_missing_from_graph(limit: int = 500) -> List[Dict[str, A
         return result
 
 
-async def mark_document_graph_ingested(doc_id: str) -> None:
+async def mark_document_graph_ingested(doc_id: str, graphiti_episode_id: str | None = None) -> None:
     """
     Marca un documento como ya hidratado en el grafo.
     Permite reanudar hydrate_graph.py sin reprocesar docs ya hechos.
@@ -274,10 +277,11 @@ async def mark_document_graph_ingested(doc_id: str) -> None:
             """
             UPDATE documents
             SET metadata = metadata || '{"graph_ingested": true}'::jsonb,
+                graphiti_episode_id = COALESCE($2, graphiti_episode_id),
                 updated_at = NOW()
             WHERE id = $1::uuid
             """,
-            doc_id,
+            doc_id, graphiti_episode_id,
         )
 
 

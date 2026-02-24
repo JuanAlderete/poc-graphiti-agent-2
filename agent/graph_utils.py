@@ -215,9 +215,10 @@ class GraphClient:
         source_reference: str,
         source_description: Optional[str] = None,
         group_id: Optional[str] = None,
-    ) -> None:
+    ) -> str:
         """
         Add an episode to the knowledge graph.
+        Returns the episode UUID as a string.
 
         Args:
             content: Raw text of the episode.
@@ -251,7 +252,7 @@ class GraphClient:
                     len(content), _MAX_EPISODE_CHARS, source_reference
                 )
 
-            await client.add_episode(
+            episode = await client.add_episode(
                 name=source_reference,
                 episode_body=truncated_content,
                 source_description=effective_description,
@@ -259,6 +260,7 @@ class GraphClient:
                 source=EpisodeType.text,
                 group_id=effective_group,
             )
+            ep_uuid = str(episode.uuid)
             estimated_output = int(estimated_input * _GRAPHITI_OUTPUT_RATIO)
             tracker.record_usage(
                 op_id,
@@ -267,6 +269,7 @@ class GraphClient:
                 settings.DEFAULT_MODEL,
                 "graphiti_add_episode",
             )
+            return ep_uuid
         except Exception:
             logger.exception("Error adding episode (%s)", source_reference)
             raise
