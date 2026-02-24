@@ -127,6 +127,7 @@ async def ingest_directory(directory: str, skip_graphiti: bool = False, max_file
     # Sin Graphiti: 8 (solo embeddings, baratos y sin LLM)
     concurrency = 1 if not skip_graphiti else 8
     sem = asyncio.Semaphore(concurrency)
+    pipeline = DocumentIngestionPipeline()
     t0 = time.time()
 
     async def _bound(f: str) -> float:
@@ -149,6 +150,45 @@ async def ingest_directory(directory: str, skip_graphiti: bool = False, max_file
     logger.info(
         "Ingestion done: %d/%d archivos en %.1fs — total $%.4f — errores: %d",
         successes, len(files), elapsed, total_cost, errors,
+    )
+
+
+async def ingest_files(file_paths: List[str], skip_graphiti: bool = False) -> None:
+    """
+    Ingesta una lista explícita de rutas de archivo.
+    Usada por el file uploader del dashboard para indexar solo los archivos recién subidos.
+    """
+    await DatabasePool.init_db()
+
+    if not skip_graphiti:
+        await GraphClient.ensure_schema()
+
+    if not file_paths:
+        logger.warning("ingest_files: lista vacía, nada que ingestar.")
+        return
+
+    concurrency = 1 if not skip_graphiti else 8
+    sem = asyncio.Semaphore(concurrency)
+    pipeline = DocumentIngestionPipeline()
+    t0 = time.time()
+
+    async def _bound(f: str) -> float:
+        async with sem:
+            return await pipeline.ingest_file(f, skip_graphiti=skip_graphiti)
+
+    mode = "Postgres Only" if skip_graphiti else "Postgres + Graphiti"
+    logger.info("Ingesting %d specific files [%s]...", len(file_paths), mode)
+
+    results = await asyncio.gather(*(_bound(f) for f in file_paths), return_exceptions=True)
+
+    successes = sum(1 for r in results if isinstance(r, float))
+    errors = sum(1 for r in results if isinstance(r, Exception))
+    total_cost = sum(r for r in results if isinstance(r, float))
+    elapsed = time.time() - t0
+
+    logger.info(
+        "ingest_files done: %d/%d archivos en %.1fs — total $%.4f — errores: %d",
+        successes, len(file_paths), elapsed, total_cost, errors,
     )
 
 

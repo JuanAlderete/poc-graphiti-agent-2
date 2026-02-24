@@ -171,7 +171,7 @@ cp .env.example .env
 docker compose up --build -d
 
 # 3. Abrir el dashboard
-# http://localhost:8501
+# http://localhost:8502
 ```
 
 **Correr ingesta u otros comandos CLI dentro del container:**
@@ -295,7 +295,7 @@ python -m poc.hydrate_graph --limit 5
 ### Dashboard interactivo
 
 ```bash
-python -m streamlit run dashboard/app.py
+python -m streamlit run dashboard/app.py --server.port 8502
 ```
 
 El dashboard incluye 7 tabs: Ingestion, Knowledge Base, Search, Generation, Analytics, Proyecciones y **Neo4j Graph** (ver sección 12).

@@ -111,24 +111,84 @@ tab_ingest, tab_kb, tab_search, tab_gen, tab_analytics, tab_projections, tab_neo
 with tab_ingest:
     st.header("Document Ingestion")
 
+    skip_graphiti_global = st.checkbox(
+        "⚡ Skip Graphiti (Postgres only)",
+        value=True,
+        help="Más rápido — solo búsqueda vectorial. Destildá para construir el grafo también.",
+    )
+
+    # ── Modo 1: Subir archivos ───────────────────────────────────────────────
+    st.subheader("📤 Subir archivos")
+    uploaded_files = st.file_uploader(
+        "Arrastrá o seleccioná archivos para indexar",
+        type=["txt", "md", "csv", "pdf"],
+        accept_multiple_files=True,
+        help="Formatos soportados: .txt, .md, .csv, .pdf",
+    )
+
+    if uploaded_files:
+        st.info(f"{len(uploaded_files)} archivo(s) seleccionado(s): {', '.join(f.name for f in uploaded_files)}")
+
+        if st.button("▶ Indexar archivos subidos", type="primary"):
+            # Guardar archivos en documents_to_index/ y ejecutar pipeline
+            save_dir = "documents_to_index"
+            os.makedirs(save_dir, exist_ok=True)
+            saved_paths = []
+
+            with st.status("Procesando archivos…", expanded=True) as upload_status:
+                # 1. Guardar en disco
+                st.write("💾 Guardando archivos…")
+                for uf in uploaded_files:
+                    dest = os.path.join(save_dir, uf.name)
+                    try:
+                        raw = uf.read()
+                        # Intentar decodificar como texto; si falla (PDF binario), avisamos
+                        try:
+                            text = raw.decode("utf-8")
+                        except UnicodeDecodeError:
+                            text = raw.decode("latin-1", errors="replace")
+                        with open(dest, "w", encoding="utf-8") as fh:
+                            fh.write(text)
+                        saved_paths.append(dest)
+                        st.write(f"  ✅ {uf.name} guardado")
+                    except Exception as e:
+                        st.write(f"  ❌ {uf.name}: {e}")
+
+                if not saved_paths:
+                    upload_status.update(label="Sin archivos válidos", state="error")
+                else:
+                    # 2. Ingestar solo los archivos recién guardados
+                    st.write(f"🔄 Indexando {len(saved_paths)} archivo(s)…")
+                    try:
+                        from ingestion.ingest import DocumentIngestionPipeline, ingest_files
+                        run_async(ingest_files(saved_paths, skip_graphiti=skip_graphiti_global))
+                        upload_status.update(label=f"✅ {len(saved_paths)} archivo(s) indexados", state="complete", expanded=False)
+                        st.success(f"Indexación completada. Revisá el tab **Knowledge Base** para verificar.")
+                    except Exception as exc:
+                        upload_status.update(label="Error de indexación", state="error")
+                        st.error(f"Error: {exc}")
+
+    st.divider()
+
+    # ── Modo 2: Directorio existente ─────────────────────────────────────────
+    st.subheader("📁 Indexar directorio")
     col1, col2 = st.columns([3, 1])
     with col1:
-        docs_dir = st.text_input("Directory Path", value="documents_to_index")
+        docs_dir = st.text_input("Ruta del directorio", value="documents_to_index")
     with col2:
-        skip_graphiti = st.checkbox(
-            "Skip Graphiti (Postgres only)", value=True, help="Faster — vector search only."
-        )
+        st.write("")  # spacer for alignment
+        st.write("")
 
-    if st.button("▶ Start Ingestion"):
+    if st.button("▶ Indexar directorio"):
         if not os.path.exists(docs_dir):
-            st.error(f"Directory '{docs_dir}' not found.")
+            st.error(f"Directorio '{docs_dir}' no encontrado.")
         else:
             with st.status("Ingesting documents…", expanded=True) as status:
                 st.write("Initialising pipeline…")
                 try:
-                    run_async(run_ingestion(docs_dir, skip_graphiti=skip_graphiti))
+                    run_async(run_ingestion(docs_dir, skip_graphiti=skip_graphiti_global))
                     status.update(label="Ingestion Complete!", state="complete", expanded=False)
-                    st.success(f"Successfully ingested documents from `{docs_dir}`.")
+                    st.success(f"Documentos indexados desde `{docs_dir}`.")
                 except Exception as exc:
                     status.update(label="Ingestion Failed", state="error")
                     st.error(f"Error: {exc}")
@@ -518,7 +578,10 @@ _NEO4J_DEFAULT_COLOR = "#B0BEC5"
 
 def _neo4j_driver():
     from agent.config import settings as _cfg
-    uri = _cfg.NEO4J_URI
+    raw_uri = _cfg.NEO4J_URI
+    # Force bolt:// scheme for standalone Neo4j — neo4j:// triggers cluster
+    # routing discovery which fails with 'Unable to retrieve routing info'.
+    uri = raw_uri.replace("neo4j://", "bolt://", 1).replace("neo4j+s://", "bolts://", 1)
     user = _cfg.NEO4J_USER
     pwd = _cfg.NEO4J_PASSWORD
     return GraphDatabase.driver(uri, auth=neo4j.basic_auth(user, pwd))
@@ -536,8 +599,9 @@ def _neo4j_single(driver, cypher):
 
 with tab_neo4j:
     st.header("Neo4j Graph Explorer")
-    neo4j_uri = os.getenv("NEO4J_URI", "neo4j://127.0.0.1:7687")
-    st.caption(f"Connected to: `{neo4j_uri}`")
+    from agent.config import settings as _neo4j_cfg
+    _effective_neo4j_uri = _neo4j_cfg.NEO4J_URI.replace("neo4j://", "bolt://", 1)
+    st.caption(f"Connected to: `{_effective_neo4j_uri}`")
 
     try:
         _driver = _neo4j_driver()

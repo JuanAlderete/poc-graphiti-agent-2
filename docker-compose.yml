@@ -47,8 +47,17 @@ services:
     build: .
     container_name: poc_app
     env_file: .env
+    environment:
+      # Override .env values with Docker-internal service names.
+      # Inside the Docker network, services talk to each other by name,
+      # NOT by 127.0.0.1 (which would loop back to the container itself).
+      NEO4J_URI: bolt://neo4j:7687
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      # Ollama runs on the host — use host.docker.internal instead of localhost
+      OPENAI_BASE_URL: http://host.docker.internal:11435/v1
     ports:
-      - "8501:8501"
+      - "8502:8501"
     volumes:
       # Persist logs between restarts
       - ./logs:/app/logs

@@ -77,12 +77,16 @@ async def check_connections() -> bool:
     print("\n=== SYSTEM HEALTH CHECK ===")
 
     # ── 1. Docker ─────────────────────────────────────────────────────────────
-    if not await check_docker():
-        return False
-
-    # ── 2. Docker Compose (auto-start) ────────────────────────────────────────
-    if not await check_docker_compose():
-        print("[!] Warning: could not verify/start Docker Compose services.")
+    # Non-fatal: when running INSIDE a Docker container, the Docker CLI is not
+    # available. We skip these checks and trust the depends_on guarantees.
+    docker_ok = await check_docker()
+    if not docker_ok:
+        print("[!] Warning: Docker CLI not found — likely running inside a container.")
+        print("[!] Skipping Docker / Compose checks and proceeding.\n")
+    else:
+        # ── 2. Docker Compose (auto-start) ────────────────────────────────────────
+        if not await check_docker_compose():
+            print("[!] Warning: could not verify/start Docker Compose services.")
 
     # ── 3. Postgres ───────────────────────────────────────────────────────────
     print("[-] Checking Postgres connection...")
