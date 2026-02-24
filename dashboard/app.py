@@ -28,17 +28,32 @@ from poc.logging_utils import (
 from poc.prompts import email, historia, reel_cta
 from poc.run_poc import run_ingestion
 from poc.hydrate_graph import hydrate_graph
+from dashboard.i18n import t, LANGUAGES
+
+# ---------------------------------------------------------------------------
+# Language selection (must be first use of session_state)
+# ---------------------------------------------------------------------------
+
+if "lang" not in st.session_state:
+    st.session_state["lang"] = "es"
+
+lang = st.session_state["lang"]
+
 
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Graphiti POC Dashboard",
+    page_title=t("app.page_title", lang),
     page_icon="🕸️",
     layout="wide",
 )
-st.title("🕸️ Graphiti POC — Agentic Control Centre")
+
+
+def _(key: str, **kwargs) -> str:
+    """Shortcut for t() using the current session language."""
+    return t(key, lang=st.session_state["lang"], **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -70,79 +85,99 @@ def load_log(filename: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.header(_("sidebar.config"))
+
+    # Language selector
+    st.subheader(_("sidebar.language"))
+    selected_lang_label = st.radio(
+        label="",
+        options=list(LANGUAGES.keys()),
+        index=list(LANGUAGES.values()).index(st.session_state["lang"]),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    if LANGUAGES[selected_lang_label] != st.session_state["lang"]:
+        st.session_state["lang"] = LANGUAGES[selected_lang_label]
+        st.rerun()
+
+    lang = st.session_state["lang"]
+
     provider = os.getenv("LLM_PROVIDER", "openai").upper()
-    st.info(f"LLM Provider: **{provider}**")
+    st.info(t("sidebar.provider", lang, p=provider))
     st.divider()
 
-    st.subheader("Actions")
-    if st.button("🗑️ Clear Logs & DB", type="primary"):
+    st.subheader(t("sidebar.actions", lang))
+    if st.button(t("sidebar.clear_btn", lang), type="primary"):
         clear_all_logs()
-        run_async(DatabasePool.clear_database())  # FIXED: use run_async
-        st.success("Logs and Database Cleared!")
+        run_async(DatabasePool.clear_database())
+        st.success(t("sidebar.clear_ok", lang))
         time.sleep(0.8)
         st.rerun()
 
-    if st.button("💧 Re-hydrate Graph (Force)", help="Push all docs to Neo4j"):
-        with st.spinner("Hydrating Graph from Postgres..."):
+    if st.button(t("sidebar.hydrate_btn", lang), help=t("sidebar.hydrate_help", lang)):
+        with st.spinner(t("sidebar.hydrate_spinner", lang)):
             try:
                 run_async(hydrate_graph(reset_flags=True))
-                st.success("Hydration Complete!")
+                st.success(t("sidebar.hydrate_ok", lang))
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(t("sidebar.hydrate_err", lang, e=e))
 
+
+# ---------------------------------------------------------------------------
+# App title
+# ---------------------------------------------------------------------------
+
+st.title(t("app.title", lang))
 
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
 
 tab_ingest, tab_kb, tab_search, tab_gen, tab_analytics, tab_projections, tab_neo4j = st.tabs([
-    "📥 Ingestion",
-    "🧠 Knowledge Base",
-    "🔍 Search",
-    "✨ Generation",
-    "📊 Analytics",
-    "📈 Proyecciones",
-    "🔵 Neo4j Graph",
+    t("tab.ingestion", lang),
+    t("tab.kb", lang),
+    t("tab.search", lang),
+    t("tab.gen", lang),
+    t("tab.analytics", lang),
+    t("tab.projections", lang),
+    t("tab.neo4j", lang),
 ])
 
 
 # ── TAB 1: INGESTION ────────────────────────────────────────────────────────
 with tab_ingest:
-    st.header("Document Ingestion")
+    st.header(t("ingest.header", lang))
 
     skip_graphiti_global = st.checkbox(
-        "⚡ Skip Graphiti (Postgres only)",
+        t("ingest.skip_graphiti", lang),
         value=True,
-        help="Más rápido — solo búsqueda vectorial. Destildá para construir el grafo también.",
+        help=t("ingest.skip_graphiti_help", lang),
     )
 
     # ── Modo 1: Subir archivos ───────────────────────────────────────────────
-    st.subheader("📤 Subir archivos")
+    st.subheader(t("ingest.upload_header", lang))
     uploaded_files = st.file_uploader(
-        "Arrastrá o seleccioná archivos para indexar",
+        t("ingest.upload_label", lang),
         type=["txt", "md", "csv", "pdf"],
         accept_multiple_files=True,
-        help="Formatos soportados: .txt, .md, .csv, .pdf",
+        help=t("ingest.upload_help", lang),
     )
 
     if uploaded_files:
-        st.info(f"{len(uploaded_files)} archivo(s) seleccionado(s): {', '.join(f.name for f in uploaded_files)}")
+        st.info(t("ingest.upload_selected", lang, n=len(uploaded_files),
+                   names=", ".join(f.name for f in uploaded_files)))
 
-        if st.button("▶ Indexar archivos subidos", type="primary"):
-            # Guardar archivos en documents_to_index/ y ejecutar pipeline
+        if st.button(t("ingest.upload_btn", lang), type="primary"):
             save_dir = "documents_to_index"
             os.makedirs(save_dir, exist_ok=True)
             saved_paths = []
 
-            with st.status("Procesando archivos…", expanded=True) as upload_status:
-                # 1. Guardar en disco
-                st.write("💾 Guardando archivos…")
+            with st.status(t("ingest.upload_processing", lang), expanded=True) as upload_status:
+                st.write(t("ingest.upload_saving", lang))
                 for uf in uploaded_files:
                     dest = os.path.join(save_dir, uf.name)
                     try:
                         raw = uf.read()
-                        # Intentar decodificar como texto; si falla (PDF binario), avisamos
                         try:
                             text = raw.decode("utf-8")
                         except UnicodeDecodeError:
@@ -150,75 +185,74 @@ with tab_ingest:
                         with open(dest, "w", encoding="utf-8") as fh:
                             fh.write(text)
                         saved_paths.append(dest)
-                        st.write(f"  ✅ {uf.name} guardado")
+                        st.write(t("ingest.upload_saved_ok", lang, name=uf.name))
                     except Exception as e:
-                        st.write(f"  ❌ {uf.name}: {e}")
+                        st.write(t("ingest.upload_saved_err", lang, name=uf.name, e=e))
 
                 if not saved_paths:
-                    upload_status.update(label="Sin archivos válidos", state="error")
+                    upload_status.update(label=t("ingest.upload_no_valid", lang), state="error")
                 else:
-                    # 2. Ingestar solo los archivos recién guardados
-                    st.write(f"🔄 Indexando {len(saved_paths)} archivo(s)…")
+                    st.write(t("ingest.upload_indexing", lang, n=len(saved_paths)))
                     try:
-                        from ingestion.ingest import DocumentIngestionPipeline, ingest_files
+                        from ingestion.ingest import ingest_files
                         run_async(ingest_files(saved_paths, skip_graphiti=skip_graphiti_global))
-                        upload_status.update(label=f"✅ {len(saved_paths)} archivo(s) indexados", state="complete", expanded=False)
-                        st.success(f"Indexación completada. Revisá el tab **Knowledge Base** para verificar.")
+                        upload_status.update(
+                            label=t("ingest.upload_done", lang, n=len(saved_paths)),
+                            state="complete", expanded=False,
+                        )
+                        st.success(t("ingest.upload_success", lang))
                     except Exception as exc:
-                        upload_status.update(label="Error de indexación", state="error")
-                        st.error(f"Error: {exc}")
+                        upload_status.update(label=t("ingest.upload_no_valid", lang), state="error")
+                        st.error(t("ingest.upload_ingest_err", lang, e=exc))
 
     st.divider()
 
     # ── Modo 2: Directorio existente ─────────────────────────────────────────
-    st.subheader("📁 Indexar directorio")
+    st.subheader(t("ingest.dir_header", lang))
     col1, col2 = st.columns([3, 1])
     with col1:
-        docs_dir = st.text_input("Ruta del directorio", value="documents_to_index")
+        docs_dir = st.text_input(t("ingest.dir_label", lang), value="documents_to_index")
     with col2:
-        st.write("")  # spacer for alignment
+        st.write("")
         st.write("")
 
-    if st.button("▶ Indexar directorio"):
+    if st.button(t("ingest.dir_btn", lang)):
         if not os.path.exists(docs_dir):
-            st.error(f"Directorio '{docs_dir}' no encontrado.")
+            st.error(t("ingest.dir_not_found", lang, d=docs_dir))
         else:
-            with st.status("Ingesting documents…", expanded=True) as status:
-                st.write("Initialising pipeline…")
+            with st.status(t("ingest.dir_spinner", lang), expanded=True) as status:
+                st.write(t("ingest.dir_init", lang))
                 try:
                     run_async(run_ingestion(docs_dir, skip_graphiti=skip_graphiti_global))
-                    status.update(label="Ingestion Complete!", state="complete", expanded=False)
-                    st.success(f"Documentos indexados desde `{docs_dir}`.")
+                    status.update(label=t("ingest.dir_done", lang), state="complete", expanded=False)
+                    st.success(t("ingest.dir_success", lang, d=docs_dir))
                 except Exception as exc:
-                    status.update(label="Ingestion Failed", state="error")
-                    st.error(f"Error: {exc}")
-
+                    status.update(label=t("ingest.dir_failed", lang), state="error")
+                    st.error(t("ingest.dir_err", lang, e=exc))
 
 
 # ── TAB 2: KNOWLEDGE BASE ───────────────────────────────────────────────────
 with tab_kb:
-    st.header("🧠 Knowledge Base")
-    if st.button("🔄 Refresh DB", key="refresh_kb"):
+    st.header(t("kb.header", lang))
+    if st.button(t("kb.refresh", lang), key="refresh_kb"):
         st.rerun()
 
     try:
         docs = run_async(get_document_summary())
         if not docs:
-            st.info("No documents found in database.")
+            st.info(t("kb.no_docs", lang))
         else:
             df_docs = pd.DataFrame(docs)
-            # Display metrics
             total_docs = len(df_docs)
             total_chunks = df_docs["chunk_count"].sum() if "chunk_count" in df_docs.columns else 0
-            
+
             c1, c2 = st.columns(2)
-            c1.metric("Total Documents", total_docs)
-            c2.metric("Total Chunks", total_chunks)
-            
+            c1.metric(t("kb.total_docs", lang), total_docs)
+            c2.metric(t("kb.total_chunks", lang), total_chunks)
+
             st.divider()
-            
-            # Search filter
-            filter_txt = st.text_input("Filter by filename/title", "", key="kb_filter")
+
+            filter_txt = st.text_input(t("kb.filter", lang), "", key="kb_filter")
             if filter_txt:
                 df_docs = df_docs[
                     df_docs["title"].str.contains(filter_txt, case=False, na=False) |
@@ -228,195 +262,199 @@ with tab_kb:
             st.dataframe(
                 df_docs,
                 column_config={
-                    "created_at": st.column_config.DatetimeColumn("Ingested At", format="D MMM YYYY, h:mm a"),
-                    "metadata": st.column_config.Column("Metadata"),
-                    "chunk_count": st.column_config.NumberColumn("Chunks"),
-                    "filepath": st.column_config.TextColumn("File Path"),
-                    "title": st.column_config.TextColumn("Title"),
+                    "created_at": st.column_config.DatetimeColumn(t("kb.col_ingested", lang), format="D MMM YYYY, h:mm a"),
+                    "metadata": st.column_config.Column(t("kb.col_metadata", lang)),
+                    "chunk_count": st.column_config.NumberColumn(t("kb.col_chunks", lang)),
+                    "filepath": st.column_config.TextColumn(t("kb.col_path", lang)),
+                    "title": st.column_config.TextColumn(t("kb.col_title", lang)),
                 },
                 width="stretch",
                 hide_index=True,
             )
     except Exception as e:
-        st.error(f"Error fetching knowledge base: {e}")
+        st.error(t("kb.error", lang, e=e))
 
 
 # ── TAB 3: SEARCH ───────────────────────────────────────────────────────────
-
 with tab_search:
-    st.header("Graph & Vector Search")
+    st.header(t("search.header", lang))
 
     col1, col2 = st.columns([3, 1])
     with col1:
-        query = st.text_area("Search Query", "Estrategias de crecimiento para startups B2B")
+        query = st.text_area(t("search.query_label", lang), t("search.query_default", lang))
     with col2:
-        search_type = st.radio("Search Type", ["Vector", "Graph", "Hybrid"], index=2)
+        _search_types = t("search.types", lang)
+        search_type = st.radio(t("search.type_label", lang), _search_types, index=2)
 
-    if st.button("🔍 Run Search"):
-        with st.spinner(f"Running {search_type} search…"):
+    if st.button(t("search.btn", lang)):
+        with st.spinner(t("search.spinner", lang, t=search_type)):
             try:
-                if search_type == "Vector":
+                # Map display label back to function (works for both languages)
+                _type_lower = search_type.lower()
+                if _type_lower in ("vector",):
                     results = run_async(vector_search_tool(query))
-                elif search_type == "Graph":
+                elif _type_lower in ("graph", "grafo"):
                     results = run_async(graph_search_tool(query))
                 else:
                     results = run_async(hybrid_search_tool(query))
 
-                st.subheader(f"{len(results)} result(s)")
-                
-                # Debug Mode Toggle
-                debug_mode = st.checkbox("Show Raw JSON (Debug Mode)", value=False)
+                st.subheader(t("search.results", lang, n=len(results)))
+
+                debug_mode = st.checkbox(t("search.debug", lang), value=False)
 
                 for i, r in enumerate(results, 1):
-                    with st.expander(f"#{i} — score {r.score:.3f} [{r.source}]"):
+                    with st.expander(f"#{i} — {t('search.score', lang)} {r.score:.3f} [{r.source}]"):
                         st.markdown(r.content)
                         if debug_mode:
-                             st.caption("Raw Result Data:")
-                             st.json(r.__dict__)
+                            st.caption(t("search.raw_data", lang))
+                            st.json(r.__dict__)
                         elif r.metadata:
-                            st.caption("Metadata:")
+                            st.caption(t("search.metadata", lang))
                             st.json(r.metadata)
             except Exception as exc:
-                st.error(f"Search failed: {exc}")
+                st.error(t("search.error", lang, e=exc))
 
 
-# ── TAB 3: GENERATION ───────────────────────────────────────────────────────
+# ── TAB 4: GENERATION ───────────────────────────────────────────────────────
 with tab_gen:
-    st.header("Content Generation")
+    st.header(t("gen.header", lang))
 
-    template_type = st.selectbox("Select Template", ["Cold Email", "Startup Story", "Instagram Reel", "Custom"])
+    _templates = t("gen.templates", lang)
+    template_type = st.selectbox(t("gen.template_label", lang), _templates)
 
     prompt = system_prompt = ""
     formato = "text"
+    topic = ""
 
-    if template_type == "Cold Email":
+    if template_type in (_templates[0],):  # Cold Email / Email Frío
         col1, col2 = st.columns(2)
         with col1:
-            topic = st.text_input("Topic", "SaaS Growth")
-            objective = st.text_input("Objective", "Agendar una demo")
+            topic = st.text_input(t("gen.topic", lang), t("gen.email_topic_default", lang))
+            objective = st.text_input(t("gen.objective", lang), t("gen.email_objective_default", lang))
         with col2:
-            context = st.text_area("Context", "Contexto simulado sobre crecimiento B2B…")
+            context = st.text_area(t("gen.context", lang), t("gen.email_context_default", lang))
         system_prompt = email.SYSTEM_PROMPT
         prompt = email.PROMPT_TEMPLATE.format(topic=topic, context=context, objective=objective)
         formato = "email"
 
-    elif template_type == "Startup Story":
+    elif template_type in (_templates[1],):  # Startup Story / Historia de Startup
         col1, col2 = st.columns(2)
         with col1:
-            topic = st.text_input("Topic", "El origen de una startup")
-            tone = st.text_input("Tone", "Inspirador")
+            topic = st.text_input(t("gen.topic", lang), t("gen.historia_topic_default", lang))
+            tone = st.text_input(t("gen.tone", lang), t("gen.historia_tone_default", lang))
         with col2:
-            context = st.text_area("Context", "Fundadores en un garaje…", height=100)
+            context = st.text_area(t("gen.context", lang), t("gen.historia_context_default", lang), height=100)
         system_prompt = historia.SYSTEM_PROMPT
         prompt = historia.PROMPT_TEMPLATE.format(topic=topic, context=context, tone=tone)
         formato = "historia"
 
-    elif template_type == "Instagram Reel":
+    elif template_type in (_templates[2],):  # Instagram Reel / Reel de Instagram
         col1, col2 = st.columns(2)
         with col1:
-            topic = st.text_input("Topic", "Productivity Hacks")
-            cta = st.text_input("CTA", "Sígueme para más")
+            topic = st.text_input(t("gen.topic", lang), t("gen.reel_topic_default", lang))
+            cta = st.text_input(t("gen.cta", lang), t("gen.reel_cta_default", lang))
         with col2:
-            context = st.text_input("Context", "Uso de herramientas AI…")
+            context = st.text_input(t("gen.context", lang), t("gen.reel_context_default", lang))
         system_prompt = reel_cta.SYSTEM_PROMPT
         prompt = reel_cta.PROMPT_TEMPLATE.format(topic=topic, context=context, cta=cta)
         formato = "reel_cta"
 
-    elif template_type == "Custom":
-        topic = st.text_input("Topic/Title", "Mi Nuevo Contenido")
-        system_prompt = st.text_area("System Prompt", "Eres un experto en marketing digital.")
-        prompt = st.text_area("Prompt", "Escribe un post sobre...", height=150)
+    elif template_type in (_templates[3],):  # Custom / Personalizado
+        topic = st.text_input(t("gen.topic", lang), t("gen.custom_topic_default", lang))
+        system_prompt = st.text_area(t("gen.system_prompt", lang), t("gen.custom_system_default", lang))
+        prompt = st.text_area(t("gen.prompt", lang), t("gen.custom_prompt_default", lang), height=150)
         formato = "custom"
 
-    if st.button("✨ Generate Content"):
-        with st.spinner("Generating…"):
+    if st.button(t("gen.btn", lang)):
+        with st.spinner(t("gen.spinner", lang)):
             try:
                 generator = get_content_generator()
-                # FIXED: pass formato/tema to generator for accurate logs
                 content = run_async(
                     generator.generate(prompt, system_prompt, formato=formato, tema=topic)
                 )
-                st.subheader("Generated Content")
+                st.subheader(t("gen.result_header", lang))
                 st.markdown(content)
                 st.divider()
-                st.caption(f"Generated using **{provider}**")
+                st.caption(t("gen.generated_with", lang, p=provider))
             except Exception as exc:
-                st.error(f"Generation failed: {exc}")
+                st.error(t("gen.error", lang, e=exc))
 
-    # ── Sección: Agentes Estructurados (NUEVO) ─────────────────────────────────
+    # ── Sección: Agentes Estructurados ────────────────────────────────────────
     st.divider()
-    st.subheader("🤖 Generación con Agentes Estructurados (Nuevo)")
-    st.caption("Output estructurado por formato con campos específicos (Hook, Script, CTA, etc.)")
+    st.subheader(t("gen.agent_header", lang))
+    st.caption(t("gen.agent_caption", lang))
 
     col_fmt, col_topic = st.columns(2)
     with col_fmt:
         new_formato = st.selectbox(
-            "Formato",
+            t("gen.agent_format", lang),
             ["reel_cta", "historia", "email", "reel_lead_magnet", "ads"],
-            key="new_gen_formato"
+            key="new_gen_formato",
         )
     with col_topic:
-        new_topic = st.text_input("Tema", "Validación de ideas de negocio", key="new_gen_topic")
+        new_topic = st.text_input(t("gen.agent_topic", lang), t("gen.agent_topic_default", lang), key="new_gen_topic")
 
-    new_context = st.text_area("Contexto (dejar vacío para búsqueda automática)", "", height=100, key="new_gen_context")
+    new_context = st.text_area(t("gen.agent_context", lang), "", height=100, key="new_gen_context")
 
     extra_params = {}
     if new_formato == "reel_cta":
-        extra_params["cta"] = st.text_input("CTA", "Sígueme para más", key="reel_cta_cta")
+        extra_params["cta"] = st.text_input(t("gen.cta", lang), t("gen.reel_cta_agent_default", lang), key="reel_cta_cta")
     elif new_formato == "historia":
-        extra_params["tone"] = st.text_input("Tono", "Educativo y cercano", key="historia_tone")
-        extra_params["tipo"] = st.selectbox("Tipo", ["educativa", "autoridad", "prueba_social", "cta"], key="historia_tipo")
+        extra_params["tone"] = st.text_input(t("gen.tone", lang), t("gen.historia_tone_agent_default", lang), key="historia_tone")
+        _historia_opts = t("gen.historia_tipo_options", lang)
+        extra_params["tipo"] = st.selectbox(t("gen.historia_tipo_label", lang), _historia_opts, key="historia_tipo")
     elif new_formato == "email":
-        extra_params["objective"] = st.text_input("Objetivo", "Generar interés", key="email_obj")
+        extra_params["objective"] = st.text_input(t("gen.objective", lang), t("gen.email_objective_agent_default", lang), key="email_obj")
     elif new_formato == "reel_lead_magnet":
-        extra_params["lead_magnet"] = st.text_input("Lead Magnet", "Checklist gratuita", key="rlm_lm")
+        extra_params["lead_magnet"] = st.text_input(t("gen.lead_magnet_label", lang), t("gen.lead_magnet_default", lang), key="rlm_lm")
     elif new_formato == "ads":
-        extra_params["tipo"] = st.selectbox("Tipo de anuncio", ["awareness", "consideration", "conversion"], key="ads_tipo")
+        _ads_opts = t("gen.ads_tipo_options", lang)
+        extra_params["tipo"] = st.selectbox(t("gen.ads_tipo_label", lang), _ads_opts, key="ads_tipo")
 
-    if st.button("🚀 Generar con Agente Estructurado"):
-        with st.spinner(f"Generando {new_formato}…"):
+    if st.button(t("gen.agent_btn", lang)):
+        with st.spinner(t("gen.agent_spinner", lang, f=new_formato)):
             try:
                 from services.generation_service import GenerationService
                 from poc.budget_guard import get_budget_summary
 
                 if not new_context:
                     results = run_async(hybrid_search_tool(new_topic, limit=3))
-                    context_for_gen = "\n\n---\n\n".join(r.content for r in results) if results else "Sin contexto."
+                    context_for_gen = "\n\n---\n\n".join(r.content for r in results) if results else t("gen.no_context_fallback", lang)
                 else:
                     context_for_gen = new_context
 
                 service = GenerationService()
                 output = run_async(service.generate(new_formato, topic=new_topic, context=context_for_gen, **extra_params))
 
-                # Budget summary
                 budget = get_budget_summary()
                 if budget["status"] == "critical":
-                    st.warning(f"⚠️ Budget crítico: {budget['percentage']}% usado. Usando modelo fallback: {budget['active_model']}")
+                    st.warning(t("gen.agent_budget_critical", lang, pct=budget["percentage"], m=budget["active_model"]))
                 elif budget["status"] == "warning":
-                    st.info(f"💡 Budget al {budget['percentage']}%. Gasto: ${budget['spent_usd']} / ${budget['budget_usd']}")
+                    st.info(t("gen.agent_budget_warn", lang,
+                               pct=budget["percentage"], spent=budget["spent_usd"], budget=budget["budget_usd"]))
 
-                st.success(f"✅ QA {'PASSED' if output.qa_passed else 'FAILED'} | Costo: ${output.cost_usd:.4f}")
+                qa_result = "PASSED" if output.qa_passed else "FAILED"
+                st.success(t("gen.agent_qa", lang, r=qa_result, c=output.cost_usd))
 
                 if not output.qa_passed:
-                    st.warning(f"QA notas: {output.qa_notes}")
+                    st.warning(t("gen.agent_qa_notes", lang, n=output.qa_notes))
 
                 st.json(output.data)
 
             except Exception as exc:
-                st.error(f"Error: {exc}")
+                st.error(t("gen.agent_error", lang, e=exc))
 
 
-# ── TAB 4: ANALYTICS ────────────────────────────────────────────────────────
+# ── TAB 5: ANALYTICS ────────────────────────────────────────────────────────
 with tab_analytics:
-    st.header("System Analytics")
-    if st.button("🔄 Refresh"):
+    st.header(t("analytics.header", lang))
+    if st.button(t("analytics.refresh", lang)):
         st.rerun()
 
     df_ingest = load_log("ingesta_log.csv")
     df_search = load_log("busqueda_log.csv")
     df_gen = load_log("generacion_log.csv")
 
-    # Overview metrics
     total_cost = 0.0
     if not df_ingest.empty and "costo_total_usd" in df_ingest.columns:
         total_cost += df_ingest["costo_total_usd"].sum()
@@ -424,36 +462,54 @@ with tab_analytics:
         total_cost += df_gen["costo_usd"].sum()
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Cost (Est)", f"${total_cost:.4f}")
-    c2.metric("Files Ingested", len(df_ingest) if not df_ingest.empty else 0)
-    c3.metric("Searches Run", len(df_search) if not df_search.empty else 0)
-    c4.metric("Pieces Generated", len(df_gen) if not df_gen.empty else 0)
+    c1.metric(t("analytics.total_cost", lang), f"${total_cost:.4f}")
+    c2.metric(t("analytics.files_ingested", lang), len(df_ingest) if not df_ingest.empty else 0)
+    c3.metric(t("analytics.searches", lang), len(df_search) if not df_search.empty else 0)
+    c4.metric(t("analytics.generated", lang), len(df_gen) if not df_gen.empty else 0)
     st.divider()
 
-    st.divider()
-
-    st.subheader("Cost Evolution")
+    st.subheader(t("analytics.cost_evolution", lang))
     cost_data = []
+    _label_time = t("analytics.axis_time", lang)
+    _label_cost = t("analytics.axis_cost", lang)
+    _label_type = t("analytics.axis_type", lang)
+
     if not df_ingest.empty and "timestamp" in df_ingest.columns:
         for _, r in df_ingest.iterrows():
-            cost_data.append({"time": r["timestamp"], "cost": r.get("costo_total_usd", 0), "type": "Ingestion"})
+            cost_data.append({
+                _label_time: r["timestamp"],
+                _label_cost: r.get("costo_total_usd", 0),
+                _label_type: t("tab.ingestion", lang)
+            })
     if not df_search.empty and "timestamp" in df_search.columns:
         for _, r in df_search.iterrows():
-            cost_data.append({"time": r["timestamp"], "cost": r.get("costo_total_usd", 0), "type": "Search"})
+            cost_data.append({
+                _label_time: r["timestamp"],
+                _label_cost: r.get("costo_total_usd", 0),
+                _label_type: t("tab.search", lang)
+            })
     if not df_gen.empty and "timestamp" in df_gen.columns:
         for _, r in df_gen.iterrows():
-            cost_data.append({"time": r["timestamp"], "cost": r.get("costo_usd", 0), "type": "Generation"})
-            
+            cost_data.append({
+                _label_time: r["timestamp"],
+                _label_cost: r.get("costo_usd", 0),
+                _label_type: t("tab.gen", lang)
+            })
+
     if cost_data:
         df_cost = pd.DataFrame(cost_data)
-        df_cost["time"] = pd.to_datetime(df_cost["time"], unit="s")
-        st.scatter_chart(df_cost, x="time", y="cost", color="type")
+        df_cost[_label_time] = pd.to_datetime(df_cost[_label_time], unit="s")
+        st.scatter_chart(df_cost, x=_label_time, y=_label_cost, color=_label_type)
     else:
-        st.info("No cost data to display.")
+        st.info(t("analytics.no_cost_data", lang))
 
     st.divider()
 
-    log1, log2, log3 = st.tabs(["Ingestion Log", "Search Log", "Generation Log"])
+    log1, log2, log3 = st.tabs([
+        t("analytics.log_ingestion", lang),
+        t("analytics.log_search", lang),
+        t("analytics.log_gen", lang),
+    ])
 
     with log1:
         if not df_ingest.empty:
@@ -461,7 +517,7 @@ with tab_analytics:
             if "tiempo_seg" in df_ingest.columns and "nombre_archivo" in df_ingest.columns:
                 st.bar_chart(df_ingest.set_index("nombre_archivo")["tiempo_seg"])
         else:
-            st.info("No ingestion logs yet.")
+            st.info(t("analytics.no_ingest_logs", lang))
 
     with log2:
         if not df_search.empty:
@@ -469,7 +525,7 @@ with tab_analytics:
             if "latencia_ms" in df_search.columns and "tipo_busqueda" in df_search.columns:
                 st.bar_chart(df_search.groupby("tipo_busqueda")["latencia_ms"].mean())
         else:
-            st.info("No search logs yet.")
+            st.info(t("analytics.no_search_logs", lang))
 
     with log3:
         if not df_gen.empty:
@@ -477,45 +533,44 @@ with tab_analytics:
             if "tokens_out" in df_gen.columns and "tiempo_seg" in df_gen.columns:
                 st.scatter_chart(df_gen, x="tokens_out", y="tiempo_seg", color="modelo")
         else:
-            st.info("No generation logs yet.")
+            st.info(t("analytics.no_gen_logs", lang))
 
-    # ── Budget Panel (NUEVO) ─────────────────────────────────────────────
+    # ── Budget Panel ─────────────────────────────────────────────────────────
     st.divider()
-    st.subheader("💰 Estado del Presupuesto")
+    st.subheader(t("analytics.budget_header", lang))
     try:
         from poc.budget_guard import get_budget_summary
         budget = get_budget_summary()
 
         col_b1, col_b2, col_b3, col_b4 = st.columns(4)
-        col_b1.metric("Gastado este mes", f"${budget['spent_usd']:.2f}")
-        col_b2.metric("Budget mensual", f"${budget['budget_usd']:.2f}")
-        col_b3.metric("% Usado", f"{budget['percentage']}%")
-        col_b4.metric("Proyección mensual", f"${budget['projected_monthly']:.2f}")
+        col_b1.metric(t("analytics.budget_spent", lang), f"${budget['spent_usd']:.2f}")
+        col_b2.metric(t("analytics.budget_total", lang), f"${budget['budget_usd']:.2f}")
+        col_b3.metric(t("analytics.budget_pct", lang), f"{budget['percentage']}%")
+        col_b4.metric(t("analytics.budget_projection", lang), f"${budget['projected_monthly']:.2f}")
 
         if budget["fallback_active"]:
-            st.error(f"🔴 Modelo fallback activo: **{budget['active_model']}**")
+            st.error(t("analytics.budget_fallback", lang, m=budget["active_model"]))
         elif budget["status"] == "warning":
-            st.warning(f"🟡 Budget al {budget['percentage']}% — modelo normal: **{budget['active_model']}**")
+            st.warning(t("analytics.budget_warn", lang, pct=budget["percentage"], m=budget["active_model"]))
         else:
-            st.success(f"🟢 Budget OK — modelo activo: **{budget['active_model']}**")
+            st.success(t("analytics.budget_ok", lang, m=budget["active_model"]))
     except Exception as e:
-        st.info(f"Budget tracking no disponible: {e}")
+        st.info(t("analytics.budget_unavail", lang, e=e))
 
 
-# ── TAB 5: PROYECCIONES ─────────────────────────────────────────────────────
+# ── TAB 6: PROYECCIONES ─────────────────────────────────────────────────────
 with tab_projections:
-    st.header("📈 Proyecciones de Costo")
-    st.caption("Ajustá los parámetros para simular distintos escenarios de uso.")
+    st.header(t("proj.header", lang))
+    st.caption(t("proj.caption", lang))
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        docs_per_month = st.number_input("Documentos / mes", min_value=1, value=250, step=10)
+        docs_per_month = st.number_input(t("proj.docs_month", lang), min_value=1, value=250, step=10)
     with col2:
-        queries_per_month = st.number_input("Búsquedas / mes", min_value=0, value=5000, step=100)
+        queries_per_month = st.number_input(t("proj.queries_month", lang), min_value=0, value=5000, step=100)
     with col3:
-        pieces_per_month = st.number_input("Piezas generadas / mes", min_value=0, value=200, step=10)
+        pieces_per_month = st.number_input(t("proj.pieces_month", lang), min_value=0, value=200, step=10)
 
-    # Use averages from logs if available, else fallback defaults
     avg_ingest_cost = (
         df_ingest["costo_total_usd"].mean()
         if not df_ingest.empty and "costo_total_usd" in df_ingest.columns
@@ -540,31 +595,29 @@ with tab_projections:
 
     st.divider()
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Ingesta / mes", f"${monthly_ingest:.2f}")
-    c2.metric("Búsquedas / mes", f"${monthly_search:.2f}")
-    c3.metric("Generación / mes", f"${monthly_gen:.2f}")
-    c4.metric("**Total / mes**", f"${monthly_total:.2f}")
+    c1.metric(t("proj.ingest_month", lang), f"${monthly_ingest:.2f}")
+    c2.metric(t("proj.search_month", lang), f"${monthly_search:.2f}")
+    c3.metric(t("proj.gen_month", lang), f"${monthly_gen:.2f}")
+    c4.metric(t("proj.total_month", lang), f"${monthly_total:.2f}")
 
-    st.metric("💰 Costo anual proyectado", f"${annual_total:.2f}")
+    st.metric(t("proj.annual", lang), f"${annual_total:.2f}")
 
-    # Decision badge
     st.divider()
     if monthly_total < 100:
-        st.success("✅ **GO** — Costo mensual por debajo del umbral de $100")
+        st.success(t("proj.go", lang))
     elif monthly_total < 200:
-        st.warning("⚠️ **OPTIMIZE** — Costo entre $100–$200/mes. Revisar oportunidades.")
+        st.warning(t("proj.optimize", lang))
     else:
-        st.error("🛑 **STOP** — Costo superior a $200/mes. Arquitectura no viable.")
+        st.error(t("proj.stop", lang))
 
-    with st.expander("Ver costos unitarios usados"):
-        st.write(
-            {
-                "avg_ingest_cost_usd": round(avg_ingest_cost, 6),
-                "avg_search_cost_usd": round(avg_search_cost, 6),
-                "avg_generation_cost_usd": round(avg_gen_cost, 6),
-                "source": "from logs" if not df_ingest.empty else "default estimates",
-            }
-        )
+    _source = t("proj.source_logs", lang) if not df_ingest.empty else t("proj.source_default", lang)
+    with st.expander(t("proj.unit_costs", lang)):
+        st.write({
+            "avg_ingest_cost_usd": round(avg_ingest_cost, 6),
+            "avg_search_cost_usd": round(avg_search_cost, 6),
+            "avg_generation_cost_usd": round(avg_gen_cost, 6),
+            "source": _source,
+        })
 
 
 # ── TAB 7: NEO4J GRAPH EXPLORER ─────────────────────────────────────────────
@@ -579,8 +632,7 @@ _NEO4J_DEFAULT_COLOR = "#B0BEC5"
 def _neo4j_driver():
     from agent.config import settings as _cfg
     raw_uri = _cfg.NEO4J_URI
-    # Force bolt:// scheme for standalone Neo4j — neo4j:// triggers cluster
-    # routing discovery which fails with 'Unable to retrieve routing info'.
+    # Force bolt:// scheme — neo4j:// triggers cluster routing which fails on standalone
     uri = raw_uri.replace("neo4j://", "bolt://", 1).replace("neo4j+s://", "bolts://", 1)
     user = _cfg.NEO4J_USER
     pwd = _cfg.NEO4J_PASSWORD
@@ -598,20 +650,19 @@ def _neo4j_single(driver, cypher):
 
 
 with tab_neo4j:
-    st.header("Neo4j Graph Explorer")
+    st.header(t("neo4j.header", lang))
     from agent.config import settings as _neo4j_cfg
     _effective_neo4j_uri = _neo4j_cfg.NEO4J_URI.replace("neo4j://", "bolt://", 1)
-    st.caption(f"Connected to: `{_effective_neo4j_uri}`")
+    st.caption(t("neo4j.connected", lang, uri=_effective_neo4j_uri))
 
     try:
         _driver = _neo4j_driver()
         _driver.verify_connectivity()
     except Exception as exc:
-        st.error(f"Cannot connect to Neo4j: {exc}")
+        st.error(t("neo4j.error", lang, e=exc))
         _driver = None
 
     if _driver:
-        # ── Stats row ────────────────────────────────────────────────────
         n_nodes = _neo4j_single(_driver, "MATCH (n) RETURN count(n) AS c")["c"]
         n_rels = _neo4j_single(_driver, "MATCH ()-[r]->() RETURN count(r) AS c")["c"]
         lbl_data = _neo4j_query(_driver,
@@ -620,38 +671,39 @@ with tab_neo4j:
         n_episodes = next((l["count"] for l in lbl_data if l["label"] == "Episodic"), 0)
 
         sc1, sc2, sc3, sc4 = st.columns(4)
-        sc1.metric("Nodes", n_nodes)
-        sc2.metric("Relationships", n_rels)
-        sc3.metric("Episodes", n_episodes)
-        sc4.metric("Entity Types", next((l["count"] for l in lbl_data if l["label"] == "Entity"), 0))
+        sc1.metric(t("neo4j.nodes", lang), n_nodes)
+        sc2.metric(t("neo4j.rels", lang), n_rels)
+        sc3.metric(t("neo4j.episodes", lang), n_episodes)
+        sc4.metric(t("neo4j.entity_types", lang), next((l["count"] for l in lbl_data if l["label"] == "Entity"), 0))
 
-        # ── Sub-tabs ─────────────────────────────────────────────────────
-        neo_tab_graph, neo_tab_episodes, neo_tab_details, neo_tab_query = st.tabs(
-            ["Interactive Graph", "Episodes", "Details", "Cypher Query"]
-        )
+        neo_tab_graph, neo_tab_episodes, neo_tab_details, neo_tab_query = st.tabs([
+            t("neo4j.subtab_graph", lang),
+            t("neo4j.subtab_episodes", lang),
+            t("neo4j.subtab_details", lang),
+            t("neo4j.subtab_query", lang),
+        ])
 
-        # ── Interactive Graph ────────────────────────────────────────────
+        # ── Interactive Graph ────────────────────────────────────────────────
         with neo_tab_graph:
             gcol1, gcol2 = st.columns([1, 4])
             with gcol1:
-                label_options = ["All"] + [l["label"] for l in lbl_data]
-                lbl_filter = st.selectbox("Filter by label", label_options, key="neo_lbl")
-                max_nodes = st.slider("Max nodes", 10, 500, 100, key="neo_max")
-                physics_on = st.checkbox("Physics", True, key="neo_phys")
+                _all_label = t("neo4j.filter_all", lang)
+                label_options = [_all_label] + [l["label"] for l in lbl_data]
+                lbl_filter = st.selectbox(t("neo4j.filter_label", lang), label_options, key="neo_lbl")
+                max_nodes = st.slider(t("neo4j.max_nodes", lang), 10, 500, 100, key="neo_max")
+                physics_on = st.checkbox(t("neo4j.physics", lang), True, key="neo_phys")
 
             with gcol2:
                 if n_nodes == 0:
-                    st.warning("No nodes in database.")
+                    st.warning(t("neo4j.no_nodes", lang))
                 else:
-                    with st.spinner("Building graph..."):
-                        # Fetch nodes
-                        if lbl_filter != "All":
+                    with st.spinner(t("neo4j.building", lang)):
+                        if lbl_filter != _all_label:
                             nodes_q = f"MATCH (n:{lbl_filter}) RETURN n, labels(n) AS labels LIMIT $lim"
                         else:
                             nodes_q = "MATCH (n) RETURN n, labels(n) AS labels LIMIT $lim"
                         raw_nodes = _neo4j_query(_driver, nodes_q, lim=max_nodes)
 
-                        # Fetch rels
                         rels_q = (
                             "MATCH (a)-[r]->(b) "
                             "RETURN a.uuid AS a_uuid, a.name AS a_name, labels(a) AS a_labels, "
@@ -661,7 +713,6 @@ with tab_neo4j:
                         )
                         raw_rels = _neo4j_query(_driver, rels_q, lim=max_nodes * 2)
 
-                        # Build pyvis
                         net = Network(
                             height="650px", width="100%",
                             bgcolor="#1a1a2e", font_color="white",
@@ -681,17 +732,16 @@ with tab_neo4j:
                             if nid in seen:
                                 return
                             seen.add(nid)
-                            pl = labels_list[0] if labels_list else "Unknown"
+                            pl = labels_list[0] if labels_list else t("neo4j.unknown", lang)
                             color = _NEO4J_LABEL_COLORS.get(pl, _NEO4J_DEFAULT_COLOR)
                             sz = 25 if pl == "Episodic" else 18
                             net.add_node(
                                 nid, label=str(name or "?")[:30],
-                                title=f"<b>{name}</b><br>Label: {pl}",
+                                title=f"<b>{name}</b><br>{t('neo4j.label', lang)}: {pl}",
                                 color=color, size=sz,
                                 font={"size": 12, "color": "white"},
                             )
 
-                        # Add nodes from rels
                         for r in raw_rels:
                             a_id = r["a_uuid"] or r["a_name"] or "a?"
                             b_id = r["b_uuid"] or r["b_name"] or "b?"
@@ -712,13 +762,11 @@ with tab_neo4j:
                                 font={"size": 8, "color": "#aaa"},
                             )
 
-                        # Add standalone nodes
                         for rec in raw_nodes:
                             n = rec["n"]
                             nid = n.get("uuid") or n.get("name") or str(id(n))
                             _add_node(nid, n.get("name"), rec["labels"])
 
-                        # Render
                         with tempfile.NamedTemporaryFile(
                             delete=False, suffix=".html", mode="w", encoding="utf-8"
                         ) as tmp:
@@ -727,9 +775,9 @@ with tab_neo4j:
                                 html = fh.read()
                             st.components.v1.html(html, height=680, scrolling=False)
 
-                        st.caption(f"Showing {len(seen)} nodes, {len(raw_rels)} relationships")
+                        st.caption(t("neo4j.showing", lang, n=len(seen), r=len(raw_rels)))
 
-        # ── Episodes ─────────────────────────────────────────────────────
+        # ── Episodes ─────────────────────────────────────────────────────────
         with neo_tab_episodes:
             eps = _neo4j_query(_driver,
                 "MATCH (e) WHERE 'Episodic' IN labels(e) "
@@ -737,43 +785,43 @@ with tab_neo4j:
                 "e.group_id AS group_id, e.source_description AS source "
                 "ORDER BY e.created_at")
             if eps:
-                st.subheader(f"Ingested Episodes ({len(eps)})")
+                st.subheader(t("neo4j.episodes_header", lang, n=len(eps)))
                 for ep in eps:
                     with st.expander(ep.get("name") or "unnamed"):
                         st.json(ep)
             else:
-                st.info("No episodic nodes found.")
+                st.info(t("neo4j.no_episodes", lang))
 
-        # ── Details ──────────────────────────────────────────────────────
+        # ── Details ──────────────────────────────────────────────────────────
         with neo_tab_details:
             dc1, dc2 = st.columns(2)
             with dc1:
-                st.subheader("Node Labels")
+                st.subheader(t("neo4j.node_labels", lang))
                 for l in lbl_data:
                     clr = _NEO4J_LABEL_COLORS.get(l["label"], _NEO4J_DEFAULT_COLOR)
                     st.markdown(
                         f'<span style="color:{clr};font-weight:600">{l["label"]}</span>: {l["count"]}',
                         unsafe_allow_html=True)
             with dc2:
-                st.subheader("Relationship Types")
+                st.subheader(t("neo4j.rel_types", lang))
                 rel_types = _neo4j_query(_driver,
                     "MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count ORDER BY count DESC")
                 for rt in rel_types:
                     st.markdown(f'`{rt["type"]}`: {rt["count"]}')
 
-        # ── Custom Query ─────────────────────────────────────────────────
+        # ── Custom Query ─────────────────────────────────────────────────────
         with neo_tab_query:
-            st.subheader("Run Cypher Query")
+            st.subheader(t("neo4j.cypher_header", lang))
             default_cypher = "MATCH (n) RETURN n.name AS name, labels(n) AS labels LIMIT 25"
-            cypher = st.text_area("Cypher", value=default_cypher, height=100, key="neo_cypher")
-            if st.button("Execute", key="neo_exec"):
+            cypher = st.text_area(t("neo4j.cypher_label", lang), value=default_cypher, height=100, key="neo_cypher")
+            if st.button(t("neo4j.cypher_btn", lang), key="neo_exec"):
                 try:
                     result = _neo4j_query(_driver, cypher)
                     if result:
                         st.dataframe(result, width="stretch")
                     else:
-                        st.info("Query returned no results.")
+                        st.info(t("neo4j.cypher_no_results", lang))
                 except Exception as qe:
-                    st.error(f"Query error: {qe}")
+                    st.error(t("neo4j.cypher_error", lang, e=qe))
 
         _driver.close()
