@@ -14,6 +14,7 @@ DOCS_DIR = Path(__file__).parent.parent / "documents_to_index"
 async def hydrate_graph(
     group_id: Optional[str] = DEFAULT_GROUP_ID,
     delay: float = 0.5,
+    reset_flags: bool = False,
 ):
     """
     Read all markdown files and add them as episodes to the graph
@@ -24,6 +25,16 @@ async def hydrate_graph(
             so all documents are retrievable with a single query.
         delay: Seconds to sleep between episodes to avoid rate limits.
     """
+    if reset_flags:
+        # Resetear flag graph_ingested en todos los documentos
+        from agent.db_utils import DatabasePool
+        pool = await DatabasePool.get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE documents SET metadata = metadata - 'graph_ingested', updated_at = NOW()"
+            )
+        logger.info("Reset graph_ingested flag on all documents.")
+    
     if not DOCS_DIR.exists():
         logger.error("Documents directory not found: %s", DOCS_DIR)
         return

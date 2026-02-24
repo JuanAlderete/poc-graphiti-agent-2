@@ -101,7 +101,6 @@ class DocumentIngestionPipeline:
 
 
 async def ingest_directory(directory: str, skip_graphiti: bool = False, max_files: int = 0) -> None:
-    pipeline = DocumentIngestionPipeline()
     await DatabasePool.init_db()
 
     if not skip_graphiti:
@@ -192,7 +191,6 @@ async def ingest_from_source(
     """
     from services.ingestion_service import IngestionService
 
-    pipeline = DocumentIngestionPipeline()
     await DatabasePool.init_db()
     if not skip_graphiti:
         await GraphClient.ensure_schema()

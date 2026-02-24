@@ -87,8 +87,8 @@ class ContentAgent(ABC):
         tokens_out = 0
 
         try:
-            raw_text, tokens_in, tokens_out = await self._call_llm(prompt, system_prompt)
-            tracker.record_usage(op_id, tokens_in, tokens_out, settings.DEFAULT_MODEL, "generation_call")
+            raw_text, tokens_in, tokens_out, model_used = await self._call_llm(prompt, system_prompt)
+            tracker.record_usage(op_id, tokens_in, tokens_out, model_used, "generation_call")
 
             data = self._parse_output(raw_text)
             qa_passed, qa_notes = self._validate(data, agent_input)
@@ -111,7 +111,7 @@ class ContentAgent(ABC):
             "tokens_contexto_in": tracker.estimate_tokens(agent_input.context),
             "tokens_prompt_in": tokens_in,
             "tokens_out": tokens_out,
-            "modelo": settings.DEFAULT_MODEL,
+            "modelo": model_used,
             "provider": settings.LLM_PROVIDER,
             "costo_usd": cost,
             "tiempo_seg": latency,
@@ -152,7 +152,10 @@ class ContentAgent(ABC):
         is_reasoning = active_model.startswith("o1-") or active_model.startswith("gpt-5")
         token_limit = self._MAX_TOKENS_REASONING if is_reasoning else self._MAX_TOKENS_DEFAULT
 
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client_kwargs = {"api_key": settings.OPENAI_API_KEY or "ollama"}
+        if settings.OPENAI_BASE_URL:
+            client_kwargs["base_url"] = settings.OPENAI_BASE_URL
+        client = AsyncOpenAI(**client_kwargs)
 
         messages = []
         if system_prompt and system_prompt.strip():
@@ -168,7 +171,7 @@ class ContentAgent(ABC):
         response = await client.chat.completions.create(**kwargs)
         text = response.choices[0].message.content or ""
         usage = response.usage
-        return text, (usage.prompt_tokens if usage else 0), (usage.completion_tokens if usage else 0)
+        return text, tokens_in, tokens_out, active_model
 
     def _load_sop(self) -> str:
         """
