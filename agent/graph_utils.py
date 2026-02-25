@@ -12,11 +12,6 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Monkey-patch: make resolve_extracted_edges tolerant to invalid UUIDs.
-#
-# Small LLMs (qwen2.5:3b, etc.) sometimes generate edges that reference
-# entity UUIDs that don't exist in the entity list.  The upstream code
-# does a direct dict lookup which crashes with KeyError.  We wrap the
-# original function to filter out those broken edges before processing.
 # ---------------------------------------------------------------------------
 import graphiti_core.utils.maintenance.edge_operations as _edge_ops
 
@@ -200,6 +195,10 @@ class GraphClient:
                 "CREATE CONSTRAINT entity_uuid IF NOT EXISTS "
                 "FOR (n:Entity) REQUIRE n.uuid IS UNIQUE"
             )
+            await client.driver.execute_query(
+                "CREATE FULLTEXT INDEX edge_name_and_fact IF NOT EXISTS "
+                "FOR ()-[r:RELATES_TO]-() ON EACH [r.name, r.fact]"
+            )
             logger.info("Graphiti schema ensured.")
         except Exception:
             logger.exception("Schema setup failed -- continuing anyway")
@@ -260,7 +259,8 @@ class GraphClient:
                 source=EpisodeType.text,
                 group_id=effective_group,
             )
-            ep_uuid = str(episode.uuid)
+            ep_node = getattr(episode, 'episode', episode)
+            ep_uuid = str(ep_node.uuid)
             estimated_output = int(estimated_input * _GRAPHITI_OUTPUT_RATIO)
             tracker.record_usage(
                 op_id,

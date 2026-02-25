@@ -256,17 +256,19 @@ with tab_kb:
             if filter_txt:
                 df_docs = df_docs[
                     df_docs["title"].str.contains(filter_txt, case=False, na=False) |
-                    df_docs["filepath"].str.contains(filter_txt, case=False, na=False)
+                    df_docs["source"].str.contains(filter_txt, case=False, na=False)
                 ]
 
             st.dataframe(
                 df_docs,
                 column_config={
-                    "created_at": st.column_config.DatetimeColumn(t("kb.col_ingested", lang), format="D MMM YYYY, h:mm a"),
-                    "metadata": st.column_config.Column(t("kb.col_metadata", lang)),
-                    "chunk_count": st.column_config.NumberColumn(t("kb.col_chunks", lang)),
-                    "filepath": st.column_config.TextColumn(t("kb.col_path", lang)),
                     "title": st.column_config.TextColumn(t("kb.col_title", lang)),
+                    "source": st.column_config.TextColumn(t("kb.col_path", lang)),
+                    "chunk_count": st.column_config.NumberColumn(t("kb.col_chunks", lang)),
+                    "total_tokens": st.column_config.NumberColumn("Tokens"),
+                    "graph_ingested": st.column_config.CheckboxColumn("En Grafo"),
+                    "has_graphiti_node": st.column_config.CheckboxColumn("ID Graphiti"),
+                    "created_at": st.column_config.DatetimeColumn(t("kb.col_ingested", lang), format="D MMM YYYY, h:mm a"),
                 },
                 width="stretch",
                 hide_index=True,
