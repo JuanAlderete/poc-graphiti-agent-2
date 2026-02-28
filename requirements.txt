@@ -1,39 +1,45 @@
-﻿# Core async / DB
-asyncpg==0.30.0
-asyncio-mqtt  # keep if used elsewhere
+﻿# =============================================================================
+# NOVOLABS AI ENGINE - Requirements
+# Soporta: OpenAI, Ollama (compatible OpenAI), Gemini
+# =============================================================================
 
-# LLM providers
+# --- Base async / DB ---
+asyncpg==0.30.0
+
+# --- LLM: OpenAI SDK (también usado para Ollama via base_url) ---
 openai==1.90.0
+
+# --- LLM: Google Gemini (opcional, solo si LLM_PROVIDER=gemini) ---
 google-generativeai
 
-# Knowledge graph
+# --- Knowledge graph (opcional, solo si ENABLE_GRAPH=true) ---
 graphiti-core==0.12.4
 neo4j==5.28.1
 
-# PostgreSQL / vector
-# pgvector is handled server-side; asyncpg handles the client
-
-# Ingestion / ML
+# --- Ingesta / ML ---
 tiktoken
 numpy>=1.24.0
 
-# Config / validation
+# --- Config / Validación ---
 pydantic==2.11.7
 pydantic-settings==2.10.0
 python-dotenv==1.1.0
 
-# Dashboard
+# --- API ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+httpx==0.28.1
+
+# --- Dashboard ---
 streamlit>=1.30.0
 plotly>=5.18.0
-nest_asyncio>=1.6.0   # ADDED: fixes asyncio.run inside Streamlit event loop
+nest_asyncio>=1.6.0
 pandas>=2.0.0
-pyvis>=0.3.2          # Neo4j graph visualization
 
-# Testing
+# --- Testing ---
 pytest==8.4.1
 pytest-asyncio==1.0.0
 
-# Misc utilities already in env (pin only what matters)
-httpx==0.28.1
+# --- Misc ---
 tenacity
 PyYAML

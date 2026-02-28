@@ -5,8 +5,8 @@ import os
 import time
 
 from agent.graph_utils import GraphClient
-from agent.tools import graph_search_tool, hybrid_search_tool, vector_search_tool
-from ingestion.ingest import ingest_directory
+from agent.tools import vector_search_with_diversity, hybrid_search
+from ingestion.embedder import get_embedder
 from poc.check_system import check_connections
 from poc.content_generator import get_content_generator
 from poc.prompts import email, historia, reel_cta, reel_lead_magnet
@@ -34,6 +34,7 @@ async def run_ingestion(directory: str, skip_graphiti: bool = False, max_files: 
 
 async def run_search_tests(skip_graphiti: bool = False) -> None:
     logger.info("Starting search tests (skip_graphiti=%s)…", skip_graphiti)
+    embedder = get_embedder()
 
     for q in TEST_QUERIES:
         q_text = q["text"]
@@ -45,12 +46,18 @@ async def run_search_tests(skip_graphiti: bool = False) -> None:
 
         try:
             logger.info("Query %s (%s): %s", q_id, q_type, q_text)
+            
+            # Generate embedding for vector/hybrid searches
+            embedding = None
+            if q_type in ("vector", "hybrid"):
+                embedding, _ = await embedder.generate_embedding(q_text)
+
             if q_type == "vector":
-                await vector_search_tool(q_text)
+                await vector_search_with_diversity(embedding)
             elif q_type == "graph":
-                await graph_search_tool(q_text)
+                await GraphClient.search(q_text)
             elif q_type == "hybrid":
-                await hybrid_search_tool(q_text)
+                await hybrid_search(q_text, embedding)
             else:
                 logger.warning("Unknown query type: %s", q_type)
         except Exception as e:
@@ -119,7 +126,9 @@ async def run_generation_with_agents(
 
     if not context:
         # Si no se pasa contexto, hacer una búsqueda híbrida para obtenerlo
-        results = await hybrid_search_tool(topic, limit=3)
+        embedder = get_embedder()
+        embedding, _ = await embedder.generate_embedding(topic)
+        results = await hybrid_search(topic, embedding, limit=3)
         context = "\n\n---\n\n".join(r.content for r in results) if results else "Sin contexto disponible."
 
     service = GenerationService()

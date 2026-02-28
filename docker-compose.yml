@@ -1,23 +1,7 @@
-version: "3.9"
-
-# =============================================================================
-# NOVOLABS AI ENGINE - Docker Compose v2.0
-#
-# SERVICIOS CORE (siempre activos):
-#   docker compose up
-#
-# CON NEO4J (solo cuando se necesite Fase 2+):
-#   docker compose --profile graph up
-#
-# SOLO INFRA (sin API, para desarrollo):
-#   docker compose up postgres
-# =============================================================================
-
 services:
 
   # ---------------------------------------------------------------------------
-  # POSTGRESQL + PGVECTOR
-  # Base de datos principal. Almacena documentos, chunks, embeddings y metadata.
+  # POSTGRESQL + PGVECTOR — Siempre activo
   # ---------------------------------------------------------------------------
   postgres:
     image: pgvector/pgvector:pg16
@@ -26,12 +10,11 @@ services:
     environment:
       POSTGRES_DB:       ${POSTGRES_DB:-novolabs}
       POSTGRES_USER:     ${POSTGRES_USER:-novolabs}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD requerido}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-novolabs} -d ${POSTGRES_DB:-novolabs}"]
       interval: 10s
@@ -40,8 +23,7 @@ services:
       start_period: 30s
 
   # ---------------------------------------------------------------------------
-  # FASTAPI - API principal
-  # Expone /ingest, /generate/weekly, /health para n8n y otros clientes externos.
+  # FASTAPI — Siempre activo
   # ---------------------------------------------------------------------------
   api:
     build:
@@ -53,49 +35,60 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
     environment:
-      # Base de datos
+      # Proveedor — la variable clave que controla todo
+      LLM_PROVIDER:      ${LLM_PROVIDER:-openai}
+
+      # OpenAI / Ollama
+      OPENAI_API_KEY:    ${OPENAI_API_KEY:-ollama}
+      OPENAI_BASE_URL:   ${OPENAI_BASE_URL:-}
+
+      # Gemini
+      GEMINI_API_KEY:    ${GEMINI_API_KEY:-}
+
+      # Modelos (vacío = auto-configurado según LLM_PROVIDER)
+      DEFAULT_MODEL:     ${DEFAULT_MODEL:-}
+      FALLBACK_MODEL:    ${FALLBACK_MODEL:-}
+      EMBEDDING_MODEL:   ${EMBEDDING_MODEL:-}
+
+      # PostgreSQL
       POSTGRES_HOST:     postgres
       POSTGRES_PORT:     5432
       POSTGRES_DB:       ${POSTGRES_DB:-novolabs}
       POSTGRES_USER:     ${POSTGRES_USER:-novolabs}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
 
-      # OpenAI
-      OPENAI_API_KEY:    ${OPENAI_API_KEY:?OPENAI_API_KEY is required}
-      DEFAULT_MODEL:     ${DEFAULT_MODEL:-gpt-4.1-mini}
-      FALLBACK_MODEL:    ${FALLBACK_MODEL:-gpt-4.1-mini}
-
-      # Budget Guard
-      MONTHLY_BUDGET_USD:        ${MONTHLY_BUDGET_USD:-50}
-      BUDGET_ALERT_THRESHOLD_1:  ${BUDGET_ALERT_THRESHOLD_1:-0.70}
-      BUDGET_ALERT_THRESHOLD_2:  ${BUDGET_ALERT_THRESHOLD_2:-0.90}
-
-      # Notion
-      NOTION_TOKEN:      ${NOTION_TOKEN:-}
-      NOTION_REELS_DB:   ${NOTION_REELS_DB:-}
-      NOTION_EMAIL_DB:   ${NOTION_EMAIL_DB:-}
-      NOTION_HISTORIA_DB: ${NOTION_HISTORIA_DB:-}
-      NOTION_ADS_DB:     ${NOTION_ADS_DB:-}
-      NOTION_RUNS_DB:    ${NOTION_RUNS_DB:-}
-      NOTION_RULES_DB:   ${NOTION_RULES_DB:-}
-
-      # Telegram
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      TELEGRAM_CHAT_ID:   ${TELEGRAM_CHAT_ID:-}
-
-      # Neo4j (solo se usa si ENABLE_GRAPH=true)
+      # Neo4j (opcional)
       ENABLE_GRAPH:      ${ENABLE_GRAPH:-false}
       NEO4J_URI:         ${NEO4J_URI:-bolt://neo4j:7687}
       NEO4J_USER:        ${NEO4J_USER:-neo4j}
       NEO4J_PASSWORD:    ${NEO4J_PASSWORD:-}
 
+      # Budget
+      MONTHLY_BUDGET_USD:        ${MONTHLY_BUDGET_USD:-50}
+      BUDGET_ALERT_THRESHOLD_1:  ${BUDGET_ALERT_THRESHOLD_1:-0.70}
+      BUDGET_ALERT_THRESHOLD_2:  ${BUDGET_ALERT_THRESHOLD_2:-0.90}
+
+      # Notion
+      NOTION_TOKEN:       ${NOTION_TOKEN:-}
+      NOTION_REELS_DB:    ${NOTION_REELS_DB:-}
+      NOTION_EMAIL_DB:    ${NOTION_EMAIL_DB:-}
+      NOTION_HISTORIA_DB: ${NOTION_HISTORIA_DB:-}
+      NOTION_ADS_DB:      ${NOTION_ADS_DB:-}
+      NOTION_RUNS_DB:     ${NOTION_RUNS_DB:-}
+      NOTION_RULES_DB:    ${NOTION_RULES_DB:-}
+
+      # Telegram
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID:   ${TELEGRAM_CHAT_ID:-}
+
       # App
-      LOG_LEVEL:         ${LOG_LEVEL:-INFO}
-      ENVIRONMENT:       ${ENVIRONMENT:-development}
+      LOG_LEVEL:          ${LOG_LEVEL:-INFO}
+      ENVIRONMENT:        ${ENVIRONMENT:-development}
+      MAX_CONCURRENT_GENERATIONS: ${MAX_CONCURRENT_GENERATIONS:-5}
 
     volumes:
       - ./logs:/app/logs
-      - .:/app   # mount para --reload en desarrollo
+      - .:/app
     depends_on:
       postgres:
         condition: service_healthy
@@ -104,31 +97,59 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 20s
 
   # ---------------------------------------------------------------------------
-  # NEO4J - Grafo de conocimiento (OPCIONAL - solo Fase 2+)
+  # OLLAMA — Solo con --profile local
   #
-  # Para activar:  docker compose --profile graph up
-  # O setear:      ENABLE_GRAPH=true
+  # Para usar:
+  #   docker compose --profile local up -d
+  #   docker exec novolabs_ollama ollama pull llama3.1:8b
+  #   docker exec novolabs_ollama ollama pull nomic-embed-text
   #
-  # No es necesario para Fase 1. El sistema funciona 100% con Postgres solo.
-  # Activar en Fase 2 cuando el volumen de documentos justifique traversals.
+  # En .env: LLM_PROVIDER=ollama y OPENAI_BASE_URL=http://ollama:11434/v1
+  # (usa el nombre del servicio Docker, no localhost)
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: novolabs_ollama
+    profiles: ["local"]
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    # Para GPU NVIDIA (descomentar si disponible):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ---------------------------------------------------------------------------
+  # NEO4J — Solo con --profile graph (Fase 2+)
   # ---------------------------------------------------------------------------
   neo4j:
     image: neo4j:5.26.0
     container_name: novolabs_neo4j
-    profiles: ["graph"]       # ← Solo se levanta con --profile graph
+    profiles: ["graph"]
     restart: unless-stopped
     environment:
-      NEO4J_AUTH:                    ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD is required when using graph profile}
-      NEO4J_PLUGINS:                 '["apoc"]'
+      NEO4J_AUTH:                     ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD requerido con --profile graph}
+      NEO4J_PLUGINS:                  '["apoc"]'
       NEO4J_dbms_memory_heap_initial__size: 512m
       NEO4J_dbms_memory_heap_max__size:     1G
-      NEO4J_dbms_memory_pagecache_size:     512m
     ports:
-      - "7474:7474"   # Browser UI
-      - "7687:7687"   # Bolt protocol
+      - "7474:7474"
+      - "7687:7687"
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
@@ -139,11 +160,10 @@ services:
       retries: 5
       start_period: 60s
 
-# =============================================================================
-# VOLÚMENES
-# =============================================================================
 volumes:
   postgres_data:
+    driver: local
+  ollama_data:
     driver: local
   neo4j_data:
     driver: local

@@ -1,222 +1,262 @@
 import asyncio
-import os
-import time
-import random
-from typing import Optional
+import json
 import logging
+import random
+import re
+import time
+from typing import Any, Optional
 
 from openai import AsyncOpenAI, RateLimitError, APIError
-from graphiti_core.llm_client.client import LLMClient
-from graphiti_core.llm_client.config import LLMConfig
-from graphiti_core.llm_client.errors import RateLimitError as GraphitiRateLimitError
+from openai.types.chat import ChatCompletion
+
+from poc.config import config
 
 logger = logging.getLogger(__name__)
 
-class OptimizedOpenAIClient(LLMClient):
+
+class LLMResponse:
+    """Respuesta normalizada del LLM."""
+    def __init__(self, content: str, prompt_tokens: int, completion_tokens: int):
+        self.content = content
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = prompt_tokens + completion_tokens
+
+
+class OptimizedOpenAIClient:
     """
-    Optimized OpenAI client with:
-    - Exponential backoff for rate limiting
-    - HTTP connection pooling
-    - Token usage optimization
-    - Request batching
+    Cliente LLM que soporta OpenAI y Ollama de forma transparente.
+
+    Para Ollama: sin retry, sin budget guard, JSON parsing tolerante.
+    Para OpenAI: exponential backoff, semáforo de concurrencia, budget guard.
     """
-    
+
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        model: str = "gpt-5-mini",
+        model: Optional[str] = None,
         max_retries: int = 5,
         base_delay: float = 1.0,
         max_delay: float = 60.0,
         temperature: float = 0.1,
     ):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or "ollama"
-        if not self.api_key:
-            raise ValueError("OPENAI_API_KEY not found")
-        
-        self.model = model
-        self.max_retries = max_retries
+        self.provider = config.LLM_PROVIDER.lower()
+        self.model = model or config.DEFAULT_MODEL
+        self.max_retries = 1 if config.is_local else max_retries  # Ollama: sin retry
         self.base_delay = base_delay
         self.max_delay = max_delay
         self.temperature = temperature
+        self._semaphore: Optional[asyncio.Semaphore] = None
 
-        client_kwargs = {
-            "api_key": self.api_key,
-            "timeout": 60.0,
-            "max_retries": 0,
+        # Construir cliente AsyncOpenAI — funciona para ambos providers
+        client_kwargs: dict[str, Any] = {
+            "api_key": config.OPENAI_API_KEY,
+            "timeout": 120.0 if config.is_local else 60.0,  # Ollama es más lento
+            "max_retries": 0,  # Manejamos retry nosotros
         }
-        base_url = os.getenv("OPENAI_BASE_URL")
-        if base_url:
-            client_kwargs["base_url"] = base_url
+        if config.OPENAI_BASE_URL:
+            client_kwargs["base_url"] = config.OPENAI_BASE_URL
 
         self._client = AsyncOpenAI(**client_kwargs)
-        
-        # Semáforo para limitar concurrencia
-        self._semaphore = None  # Se inicializará en setup
-        
-        logger.info(f"Initialized OptimizedOpenAIClient with model: {model}")
-    
-    async def setup(self):
-        """Initialize async resources."""
-        self._semaphore = asyncio.Semaphore(3)  # Máximo 3 requests concurrentes
-    
-    async def close(self):
-        """Cleanup resources."""
-        await self._client.close()
-    
-    def _calculate_delay(self, attempt: int, retry_after: Optional[float] = None) -> float:
+
+        logger.info(
+            "OptimizedOpenAIClient inicializado: provider=%s, model=%s, base_url=%s",
+            self.provider,
+            self.model,
+            config.OPENAI_BASE_URL or "https://api.openai.com/v1",
+        )
+
+    @property
+    def semaphore(self) -> asyncio.Semaphore:
+        """Lazy init del semáforo para evitar problemas con event loops."""
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_GENERATIONS)
+        return self._semaphore
+
+    async def complete(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        response_format: Optional[dict] = None,
+    ) -> tuple[str, LLMResponse]:
         """
-        Calculate delay with exponential backoff and jitter.
-        
-        Formula: min(base_delay * 2^attempt + random_jitter, max_delay)
+        Genera una completion y retorna (content, LLMResponse).
+
+        Para Ollama: el response_format={"type": "json_object"} se traduce
+        a instrucciones en el prompt (modelos pequeños lo ignoran a veces).
         """
-        if retry_after:
-            # Respetar el header Retry-After de OpenAI
-            base = retry_after
-        else:
-            base = self.base_delay * (2 ** attempt)
-        
-        # Agregar jitter (±25%) para evitar thundering herd
-        jitter = base * 0.25 * (2 * random.random() - 1)
-        delay = min(base + jitter, self.max_delay)
-        
-        return max(delay, 0.1)  # Mínimo 100ms
-    
-    def _truncate_content(self, content: str, max_tokens: int = 4000) -> str:
-        """
-        Truncate content to stay within token limits.
-        Aproximadamente 4 caracteres por token para inglés/español.
-        """
-        max_chars = max_tokens * 4
-        
-        if len(content) <= max_chars:
-            return content
-        
-        # Truncar manteniendo el inicio y final (contexto más importante)
-        half_limit = max_chars // 2
-        truncated = content[:half_limit] + "\n\n[... contenido truncado por límite de tokens ...]\n\n" + content[-half_limit:]
-        
-        logger.warning(f"Content truncated from {len(content)} to {len(truncated)} chars")
-        return truncated
-    
+        use_model = model or self.model
+        use_temp = temperature if temperature is not None else self.temperature
+
+        messages = [{"role": "user", "content": prompt}]
+
+        # En Ollama: agregar instrucción JSON al prompt si se pide json_object
+        if config.is_local and response_format == {"type": "json_object"}:
+            messages = [{
+                "role": "user",
+                "content": prompt + "\n\nRespóndé ÚNICAMENTE con JSON válido, sin texto antes ni después, sin markdown."
+            }]
+            response_format = None  # Ollama puede no soportarlo
+
+        return await self._make_request_with_retry(
+            messages=messages,
+            model=use_model,
+            temperature=use_temp,
+            max_tokens=max_tokens,
+            response_format=response_format,
+        )
+
+    async def complete_with_system(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        response_format: Optional[dict] = None,
+    ) -> tuple[str, LLMResponse]:
+        """Completion con system prompt separado."""
+        use_model = model or self.model
+        use_temp = temperature if temperature is not None else self.temperature
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        if config.is_local and response_format == {"type": "json_object"}:
+            messages[-1]["content"] += "\n\nRespóndé ÚNICAMENTE con JSON válido."
+            response_format = None
+
+        return await self._make_request_with_retry(
+            messages=messages,
+            model=use_model,
+            temperature=use_temp,
+            response_format=response_format,
+        )
+
     async def _make_request_with_retry(
         self,
         messages: list,
-        temperature: Optional[float] = None,
+        model: str,
+        temperature: float,
         max_tokens: Optional[int] = None,
-    ) -> str:
+        response_format: Optional[dict] = None,
+    ) -> tuple[str, LLMResponse]:
         """
-        Make API request with exponential backoff retry logic.
+        Ejecuta la request con exponential backoff para OpenAI.
+        Para Ollama: sin retry, timeout más largo.
         """
-        temp = temperature if temperature is not None else self.temperature
-        
-        # Lazy-init semaphore if setup() was never called
-        if self._semaphore is None:
-            self._semaphore = asyncio.Semaphore(3)
-        
-        for attempt in range(self.max_retries):
+        async with self.semaphore:
+            for attempt in range(self.max_retries):
+                try:
+                    kwargs: dict[str, Any] = {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                    }
+                    if max_tokens:
+                        kwargs["max_tokens"] = max_tokens
+                    if response_format:
+                        kwargs["response_format"] = response_format
+
+                    response: ChatCompletion = await self._client.chat.completions.create(**kwargs)
+
+                    content = response.choices[0].message.content or ""
+                    llm_response = LLMResponse(
+                        content=content,
+                        prompt_tokens=response.usage.prompt_tokens if response.usage else 0,
+                        completion_tokens=response.usage.completion_tokens if response.usage else 0,
+                    )
+                    return content, llm_response
+
+                except RateLimitError as e:
+                    if config.is_local:
+                        # Ollama no debería tener rate limits
+                        logger.warning("Rate limit en Ollama (inesperado): %s", e)
+                        raise
+
+                    retry_after = self._extract_retry_after(e)
+                    delay = self._calculate_delay(attempt, retry_after)
+                    logger.warning(
+                        "Rate limit en intento %d/%d. Esperando %.1fs...",
+                        attempt + 1, self.max_retries, delay
+                    )
+                    if attempt < self.max_retries - 1:
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
+
+                except APIError as e:
+                    if attempt < self.max_retries - 1 and not config.is_local:
+                        delay = self._calculate_delay(attempt)
+                        logger.warning("API error en intento %d: %s. Retry en %.1fs", attempt + 1, e, delay)
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
+
+                except Exception as e:
+                    logger.error("Error inesperado en completions: %s", e)
+                    raise
+
+        raise RuntimeError("Max retries alcanzado sin respuesta exitosa")
+
+    def parse_json_response(self, content: str) -> dict:
+        """
+        Parsea la respuesta JSON del LLM de forma tolerante.
+
+        Modelos locales (Ollama con llama3.2) a veces envuelven el JSON
+        en markdown o agregan texto antes/después. Este método lo maneja.
+        """
+        if not content:
+            return {}
+
+        # Intento 1: JSON directo
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            pass
+
+        # Intento 2: extraer JSON de bloque markdown ```json ... ```
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+        if match:
             try:
-                # Limitar concurrencia con semáforo
-                async with self._semaphore:
-                    response = await self._client.chat.completions.create(
-                        model=self.model,
-                        messages=messages,
-                        temperature=temp,
-                        max_tokens=max_tokens,
-                    )
-                    
-                    # Log de uso de tokens para monitoreo
-                    usage = response.usage
-                    if usage:
-                        logger.info(
-                            f"Tokens used - Prompt: {usage.prompt_tokens}, "
-                            f"Completion: {usage.completion_tokens}, "
-                            f"Total: {usage.total_tokens}"
-                        )
-                    
-                    return response.choices[0].message.content
-            
-            except RateLimitError as e:
-                # insufficient_quota = billing problem, not a transient rate limit.
-                # Retrying is useless — stop immediately with a clear message.
-                error_code = getattr(e, "code", None)
-                if error_code == "insufficient_quota":
-                    logger.critical(
-                        "FATAL: OpenAI quota exceeded (insufficient_quota). "
-                        "Please top up your account at https://platform.openai.com/account/billing"
-                    )
-                    raise
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
 
-                retry_after = None
+        # Intento 3: buscar el primer { ... } en el texto
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
 
-                # Extraer Retry-After del header si existe
-                if hasattr(e, 'response') and e.response:
-                    retry_after = e.response.headers.get('retry-after')
-                    if retry_after:
-                        retry_after = float(retry_after)
+        logger.warning("No se pudo parsear JSON de la respuesta: %s", content[:200])
+        return {}
 
-                delay = self._calculate_delay(attempt, retry_after)
+    def _calculate_delay(self, attempt: int, retry_after: Optional[float] = None) -> float:
+        if retry_after:
+            base = retry_after
+        else:
+            base = self.base_delay * (2 ** attempt)
+        jitter = base * 0.25 * (2 * random.random() - 1)
+        return min(max(base + jitter, 0.1), self.max_delay)
 
-                logger.warning(
-                    f"Rate limit hit (attempt {attempt + 1}/{self.max_retries}). "
-                    f"Retrying in {delay:.2f}s..."
-                )
+    def _extract_retry_after(self, error: RateLimitError) -> Optional[float]:
+        try:
+            if hasattr(error, "response") and error.response:
+                retry_after = error.response.headers.get("retry-after")
+                if retry_after:
+                    return float(retry_after)
+        except Exception:
+            pass
+        return None
 
-                await asyncio.sleep(delay)
-            
-            except APIError as e:
-                # Errores transitorios de API (5xx, timeouts)
-                if attempt < self.max_retries - 1:
-                    delay = self._calculate_delay(attempt)
-                    logger.warning(f"API error: {e}. Retrying in {delay:.2f}s...")
-                    await asyncio.sleep(delay)
-                else:
-                    raise
-            
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}")
-                raise
-        
-        # Si agotamos los retries
-        raise GraphitiRateLimitError(f"Max retries ({self.max_retries}) exceeded")
-    
-    async def generate(
-        self,
-        prompt: str,
-        system_prompt: Optional[str] = None,
-        temperature: Optional[float] = None,
-    ) -> str:
-        """
-        Generate text with token optimization and retry logic.
-        """
-        # Optimizar el contenido del prompt
-        optimized_prompt = self._truncate_content(prompt, max_tokens=3500)
-        
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        
-        messages.append({"role": "user", "content": optimized_prompt})
-        
-        return await self._make_request_with_retry(
-            messages=messages,
-            temperature=temperature,
-        )
-    
-    # Métodos requeridos por Graphiti
-    async def generate_with_context(self, context: str, prompt: str) -> str:
-        """Generate with context (used by Graphiti)."""
-        combined = f"Context:\n{context}\n\nTask:\n{prompt}"
-        return await self.generate(combined)
-    
-    async def generate_entity_summary(self, text: str) -> str:
-        """Generate entity summary with token optimization."""
-        optimized = self._truncate_content(text, max_tokens=2000)
-        prompt = f"Summarize the key entities in this text:\n\n{optimized}"
-        return await self.generate(prompt)
-    
-    async def generate_edge_summary(self, source: str, target: str, context: str) -> str:
-        """Generate edge summary."""
-        optimized_context = self._truncate_content(context, max_tokens=1500)
-        prompt = f"Describe the relationship between '{source}' and '{target}':\n\n{optimized_context}"
-        return await self.generate(prompt)
+    async def close(self):
+        await self._client.close()
+
+
+# Alias para compatibilidad con código legacy
+CustomOpenAIClient = OptimizedOpenAIClient

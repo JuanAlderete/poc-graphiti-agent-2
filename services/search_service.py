@@ -7,8 +7,9 @@ import logging
 from typing import List, Optional
 
 from agent.models import SearchResult
-from agent.tools import vector_search_tool, graph_search_tool, hybrid_search_tool
+from agent.tools import vector_search_with_diversity, hybrid_search
 from agent.retrieval_engine import RetrievalEngine
+from ingestion.embedder import get_embedder
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +45,33 @@ class SearchService:
             query: Texto de búsqueda.
             limit: Número máximo de resultados.
         """
+        embedder = get_embedder()
+        embedding = None
+        if mode in ("vector", "hybrid"):
+            embedding, _ = await embedder.generate_embedding(query)
+
         if mode == "vector":
-            return await vector_search_tool(query, limit=limit)
+            return await vector_search_with_diversity(embedding, limit=limit)
         elif mode == "graph":
-            return await graph_search_tool(query)
+            from agent.graph_utils import GraphClient
+            # GraphClient.search returns a list of raw objects, we need to convert to SearchResult if missing
+            # But the original search_service.py expected SearchResult. 
+            # Given the requirement to adapt, let's wrap graph results or use hybrid_real
+            results = await GraphClient.search(query, num_results=limit)
+            return [
+                SearchResult(
+                    content=str(r),
+                    metadata={},
+                    score=0.9,
+                    source="graph"
+                ) for r in results
+            ]
         elif mode == "hybrid":
-            return await hybrid_search_tool(query, limit=limit)
+            return await hybrid_search(query, embedding, limit=limit)
         elif mode == "hybrid_real":
             return await self._retrieval_engine.search(query, limit=limit)
         else:
             logger.warning("Unknown search mode '%s', falling back to hybrid", mode)
-            return await hybrid_search_tool(query, limit=limit)
+            if embedding is None:
+                embedding, _ = await embedder.generate_embedding(query)
+            return await hybrid_search(query, embedding, limit=limit)

@@ -219,16 +219,8 @@ class RetrievalEngine:
 
     async def _fallback_vector_search(self, query: str, limit: int) -> List[SearchResult]:
         """Fallback a búsqueda vectorial cuando el grafo no da resultados."""
-        from agent.db_utils import vector_search
+        from agent.tools import vector_search_with_diversity
         embedder = get_embedder()
         embedding, _ = await embedder.generate_embedding(query)
-        rows = await vector_search(embedding, limit=limit)
-        return [
-            SearchResult(
-                content=row["content"],
-                metadata=row.get("metadata", {}),
-                score=row.get("score", 0.0),
-                source="vector_fallback",
-            )
-            for row in rows
-        ]
+        # Búsqueda vectorial sin filtros de diversidad para el fallback
+        return await vector_search_with_diversity(embedding, limit=limit)
