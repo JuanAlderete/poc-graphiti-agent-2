@@ -1,78 +1,151 @@
+version: "3.9"
+
+# =============================================================================
+# NOVOLABS AI ENGINE - Docker Compose v2.0
+#
+# SERVICIOS CORE (siempre activos):
+#   docker compose up
+#
+# CON NEO4J (solo cuando se necesite Fase 2+):
+#   docker compose --profile graph up
+#
+# SOLO INFRA (sin API, para desarrollo):
+#   docker compose up postgres
+# =============================================================================
+
 services:
-  # ── PostgreSQL + pgvector ──────────────────────────────────────────────
+
+  # ---------------------------------------------------------------------------
+  # POSTGRESQL + PGVECTOR
+  # Base de datos principal. Almacena documentos, chunks, embeddings y metadata.
+  # ---------------------------------------------------------------------------
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: poc_postgres
-    env_file: .env
+    container_name: novolabs_postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin123}
-      POSTGRES_DB: ${POSTGRES_DB:-graphiti_poc}
+      POSTGRES_DB:       ${POSTGRES_DB:-novolabs}
+      POSTGRES_USER:     ${POSTGRES_USER:-novolabs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
     ports:
-      - "5435:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d graphiti_poc"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
-  # ── Neo4j (Knowledge Graph) ────────────────────────────────────────────
-  neo4j:
-    image: neo4j:5.26.0
-    container_name: poc_neo4j
-    environment:
-      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-adminadmin}
-      NEO4J_PLUGINS: '["apoc"]'
-      NEO4J_apoc_export_file_enabled: "true"
-      NEO4J_apoc_import_file_enabled: "true"
-      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
-      NEO4J_dbms_memory_heap_initial__size: "512m"
-      NEO4J_dbms_memory_heap_max__size: "1G"
-    ports:
-      - "7474:7474"  # Browser UI
-      - "7687:7687"  # Bolt protocol
-    volumes:
-      - neo4j_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider localhost:7474 || exit 1"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-novolabs} -d ${POSTGRES_DB:-novolabs}"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
 
-  # ── Application (Dashboard + Pipeline) ─────────────────────────────────
-  app:
-    build: .
-    container_name: poc_app
-    env_file: .env
-    environment:
-      # Override .env values with Docker-internal service names.
-      # Inside the Docker network, services talk to each other by name,
-      # NOT by 127.0.0.1 (which would loop back to the container itself).
-      NEO4J_URI: bolt://neo4j:7687
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      # Ollama runs on the host — use host.docker.internal instead of localhost
-      OPENAI_BASE_URL: http://host.docker.internal:11435/v1
+  # ---------------------------------------------------------------------------
+  # FASTAPI - API principal
+  # Expone /ingest, /generate/weekly, /health para n8n y otros clientes externos.
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: novolabs_api
+    restart: unless-stopped
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
-      - "8502:8501"
+      - "${API_PORT:-8000}:8000"
+    environment:
+      # Base de datos
+      POSTGRES_HOST:     postgres
+      POSTGRES_PORT:     5432
+      POSTGRES_DB:       ${POSTGRES_DB:-novolabs}
+      POSTGRES_USER:     ${POSTGRES_USER:-novolabs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+      # OpenAI
+      OPENAI_API_KEY:    ${OPENAI_API_KEY:?OPENAI_API_KEY is required}
+      DEFAULT_MODEL:     ${DEFAULT_MODEL:-gpt-4.1-mini}
+      FALLBACK_MODEL:    ${FALLBACK_MODEL:-gpt-4.1-mini}
+
+      # Budget Guard
+      MONTHLY_BUDGET_USD:        ${MONTHLY_BUDGET_USD:-50}
+      BUDGET_ALERT_THRESHOLD_1:  ${BUDGET_ALERT_THRESHOLD_1:-0.70}
+      BUDGET_ALERT_THRESHOLD_2:  ${BUDGET_ALERT_THRESHOLD_2:-0.90}
+
+      # Notion
+      NOTION_TOKEN:      ${NOTION_TOKEN:-}
+      NOTION_REELS_DB:   ${NOTION_REELS_DB:-}
+      NOTION_EMAIL_DB:   ${NOTION_EMAIL_DB:-}
+      NOTION_HISTORIA_DB: ${NOTION_HISTORIA_DB:-}
+      NOTION_ADS_DB:     ${NOTION_ADS_DB:-}
+      NOTION_RUNS_DB:    ${NOTION_RUNS_DB:-}
+      NOTION_RULES_DB:   ${NOTION_RULES_DB:-}
+
+      # Telegram
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID:   ${TELEGRAM_CHAT_ID:-}
+
+      # Neo4j (solo se usa si ENABLE_GRAPH=true)
+      ENABLE_GRAPH:      ${ENABLE_GRAPH:-false}
+      NEO4J_URI:         ${NEO4J_URI:-bolt://neo4j:7687}
+      NEO4J_USER:        ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD:    ${NEO4J_PASSWORD:-}
+
+      # App
+      LOG_LEVEL:         ${LOG_LEVEL:-INFO}
+      ENVIRONMENT:       ${ENVIRONMENT:-development}
+
     volumes:
-      # Persist logs between restarts
       - ./logs:/app/logs
-      # Mount documents so you can add files without rebuilding
-      - ./documents_to_index:/app/documents_to_index
+      - .:/app   # mount para --reload en desarrollo
     depends_on:
       postgres:
         condition: service_healthy
-      neo4j:
-        condition: service_healthy
-    # Allow connecting to Ollama running on the host machine
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
+  # ---------------------------------------------------------------------------
+  # NEO4J - Grafo de conocimiento (OPCIONAL - solo Fase 2+)
+  #
+  # Para activar:  docker compose --profile graph up
+  # O setear:      ENABLE_GRAPH=true
+  #
+  # No es necesario para Fase 1. El sistema funciona 100% con Postgres solo.
+  # Activar en Fase 2 cuando el volumen de documentos justifique traversals.
+  # ---------------------------------------------------------------------------
+  neo4j:
+    image: neo4j:5.26.0
+    container_name: novolabs_neo4j
+    profiles: ["graph"]       # ← Solo se levanta con --profile graph
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH:                    ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD is required when using graph profile}
+      NEO4J_PLUGINS:                 '["apoc"]'
+      NEO4J_dbms_memory_heap_initial__size: 512m
+      NEO4J_dbms_memory_heap_max__size:     1G
+      NEO4J_dbms_memory_pagecache_size:     512m
+    ports:
+      - "7474:7474"   # Browser UI
+      - "7687:7687"   # Bolt protocol
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "${NEO4J_USER:-neo4j}", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+# =============================================================================
+# VOLÚMENES
+# =============================================================================
 volumes:
   postgres_data:
+    driver: local
   neo4j_data:
+    driver: local
+  neo4j_logs:
+    driver: local
