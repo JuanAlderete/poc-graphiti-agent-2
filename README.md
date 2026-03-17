@@ -3,23 +3,25 @@
 Sistema de generación automatizada de contenido semanal para Novolabs.
 Ingesta transcripciones → genera reels, historias, emails y ads → publica en Notion.
 
-**Versión:** 2.0 (Fase 1 - Simplificada)  
-**Stack:** FastAPI + PostgreSQL + pgvector + n8n  
+**Versión:** 3.0 (Fase 1 - Simplificada + Graph-in-a-Box)  
+**Stack:** FastAPI + PostgreSQL + pgvector + n8n + Multi-LLM (OpenAI, Ollama, Gemini)  
 **Estado:** En desarrollo activo
 
 ---
 
-## Arquitectura simplificada (v2.0)
+## Arquitectura simplificada (v3.0)
 
-La arquitectura v2.0 incorpora feedback de revisión técnica externa. Los cambios principales respecto a v1.0:
+La arquitectura v3.0 evoluciona el diseño para añadir capacidades avanzadas manteniendo la simplicidad:
 
-**Neo4j es ahora opcional.** En Fase 1 el sistema corre 100% sobre PostgreSQL con metadata enriquecida. Neo4j se activa en Fase 2 cuando el volumen de documentos justifique traversals de grafo complejos. Esto elimina el problema más complejo del diseño anterior (entity resolution) y reduce el stack de 3 a 2 servicios core.
+**Graph-in-a-Box con Postgres (v3.0).** En lugar de depender inicialmente de Neo4j, implementamos extracción de entidades y relaciones por LLM durante la ingesta (inspirado en LightRAG). Esta metadata semántica adicional se guarda en índices GIN dentro de Postgres, permitiendo búsquedas semánticas híbridas directas (Vector + Entities + Diversidad temporal).
+
+**Soporte Multi-LLM (v3.0).** Interfaz unificada que soporta de forma nativa a OpenAI (para producción), Ollama (para pruebas locales a costo cero) y Gemini. Simplemente se cambia el proveedor en el archivo `.env`.
+
+**Neo4j es ahora opcional.** En Fase 1 el sistema corre 100% sobre PostgreSQL con su nueva metadata enriquecida de entidades. Neo4j se activa en Fase 2 cuando el volumen de documentos justifique traversals de grafo complejos o análisis visuales interactivos.
 
 **QA Gate programático.** Las validaciones de calidad son por defecto programáticas (longitud, presencia de CTA, detección de idioma). El LLM solo valida en muestras aleatorias del 10%, no en cada pieza. Esto reduce el costo de QA aproximadamente un 90%.
 
-**Sin frameworks de agentes.** Los subagentes son clases Python con `generate()`, `_build_prompt()` y `_parse_response()`. Sin Pydantic AI ni LangGraph en Fase 1. LangGraph queda eliminado del roadmap hasta que haya un caso de uso concreto.
-
-**Metadata semántica en Postgres.** En vez de depender de Neo4j para clasificar contenido, cada chunk tiene metadata JSONB enriquecida con `source_type`, `topics`, `domain`, `content_level`, `emotion`, `used_count` y `last_used_at`. Esto permite filtros avanzados y diversity tracking sin infraestructura adicional.
+**Metadata semántica en Postgres.** Cada chunk de información tiene metadata JSONB enriquecida con elementos clásicos (`source_type`, `topics`, `emotion`, `used_count`) y ahora sumando entidades y relaciones. Esto permite filtros avanzados y context-retrieval sin infraestructura adicional.
 
 ### Flujo semanal
 
@@ -138,13 +140,16 @@ cp .env.example .env
 # Editar .env con tus valores reales
 ```
 
-Campos obligatorios en `.env`:
+La variable que define todo el comportamiento del núcleo LLM es `LLM_PROVIDER`. Campos obligatorios en `.env`:
 
 ```bash
-OPENAI_API_KEY=sk-...
+LLM_PROVIDER=openai         # Opciones: openai | ollama | gemini
+OPENAI_API_KEY=sk-...       # Si usas OpenAI
 POSTGRES_PASSWORD=tu_password_seguro
-MONTHLY_BUDGET_USD=50       # Límite mensual en USD
+MONTHLY_BUDGET_USD=50       # Límite mensual en USD (ignorado en Ollama)
 ```
+
+**Importante:** Si cambias de entorno o de proveedor de LLM (por ejemplo de OpenAI a Ollama), el tamaño del vector embeddings cambia (1536 a 768 dimensiones). Debes reiniciar la base de datos usando `bash scripts/reset_db.sh`.
 
 Campos opcionales para Fase 1 (completar cuando corresponda):
 
@@ -265,18 +270,23 @@ Cada chunk almacenado en Postgres tiene metadata JSONB enriquecida, clasificada 
   "emotion":        "frustracion",
   "domain":         "ventas",
   "edition":        14,
-  "alumno_id":      "juan-garcia",
-  "fecha":          "2026-02-15",
   "used_count":     0,
   "last_used_at":   null,
-  "is_deleted":     false
+  "is_deleted":     false,
+  "entities": [
+    {"name": "Cierre de ventas", "type": "Etapa de Proceso"},
+    {"name": "Sesgo de confirmación", "type": "Concepto Psicológico"}
+  ],
+  "relationships": [
+    {"subject": "Sesgo de confirmación", "relation": "dificulta", "object": "Cierre de ventas"}
+  ]
 }
 ```
 
-Esta metadata permite:
-- Filtros avanzados en búsqueda (`domain=ventas`, `topics=objeciones`)
-- Diversity tracking sin tabla extra (`used_count`, `last_used_at`)
-- Analytics de fuentes más usadas y mejor calificadas
+Esta metadata de alta granularidad permite:
+- Filtros avanzados en búsqueda por vectores (`domain=ventas`).
+- Contexto de **Entidades** (Hybrid Entity Search) identificando de qué trata realmente cada bloque de texto de manera dinámica.
+- Diversity tracking sin tabla extra (`used_count`).
 
 ---
 
@@ -339,10 +349,10 @@ FALLBACK_MODEL=gpt-4.1-mini
 | Search Intent Generator (5 ángulos × 4 tópicos) | ~20 | ~$0.40 |
 | Generación de piezas | ~100 | ~$6.00 |
 | QA LLM (10% de piezas) | ~10 | ~$0.30 |
-| Embeddings de ingesta (semanal) | variable | ~$0.20 |
+| Extracción de Entidades y Embeddings en ingesta | variable | ~$0.20 - $0.50 |
 | **Total semanal estimado** | | **~$7–10** |
 
-Gemini Flash 2.0 es una alternativa más barata si el costo supera el target de $10/semana.
+Utilizar **Ollama** de forma local reduce el costo de LLM directamente a **$0**, siendo ideal para desarrollo y fase de pruebas sin preocuparse por el budget guard. **Gemini Flash** es una alternativa económica nativa adicional.
 
 ---
 

@@ -116,6 +116,14 @@ class AppConfig(BaseSettings):
     ENVIRONMENT: str = Field(default="development")
     API_PORT: int = Field(default=8000)
     MAX_CONCURRENT_GENERATIONS: int = Field(default=5)
+    ENABLE_ENTITY_EXTRACTION: bool = Field(
+        default=True,
+        description=(
+            "Activa la extracción de entidades y relaciones por LLM en la ingesta (estilo LightRAG). "
+            "Costo estimado: ~$0.001 por chunk con gpt-4.1-mini. En Ollama: $0. "
+            "Deshabilitar si el presupuesto es muy ajustado o para pruebas rápidas."
+        )
+    )
 
     # =========================================================================
     # VALIDADOR: auto-configura modelos y URLs según LLM_PROVIDER

@@ -12,10 +12,6 @@ from poc.config import config
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# CONNECTION POOL
-# =============================================================================
-
 class DatabasePool:
     _pool: Optional[asyncpg.Pool] = None
     _loop: Optional[asyncio.AbstractEventLoop] = None
@@ -24,7 +20,6 @@ class DatabasePool:
     async def get_pool(cls) -> asyncpg.Pool:
         current_loop = asyncio.get_running_loop()
 
-        # Resetear pool si el event loop cambió (común en testing y Streamlit)
         if cls._pool is not None:
             if cls._loop is not current_loop or (cls._loop and cls._loop.is_closed()):
                 logger.warning("Event loop cambió — reseteando pool de DB.")
@@ -45,7 +40,6 @@ class DatabasePool:
                 min_size=2,
                 max_size=10,
                 command_timeout=30,
-                # Registrar codec para vectores pgvector
                 init=_register_vector_codec,
             )
             cls._loop = current_loop
@@ -64,20 +58,16 @@ class DatabasePool:
     @classmethod
     async def init_db(cls) -> None:
         """
-        Inicializa extensiones y crea tablas si no existen.
-
-        CRÍTICO: La columna `embedding` se crea con las dimensiones configuradas
-        en config.EMBEDDING_DIMS. Si cambiás de proveedor, ejecutá reset_db.sh.
+        Inicializa extensiones y crea tablas + índices.
+        NUEVO v3.0: agrega índices GIN para entities y relationships.
         """
         pool = await cls.get_pool()
         expected_dims = config.EMBEDDING_DIMS
 
         async with pool.acquire() as conn:
-            # Extensiones
             for ext in ("vector", "uuid-ossp", "pg_trgm"):
                 await conn.execute(f'CREATE EXTENSION IF NOT EXISTS "{ext}";')
 
-            # Verificar si chunks ya existe y tiene las dims correctas
             table_exists = await conn.fetchval(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
                 "WHERE table_schema='public' AND table_name='chunks')"
@@ -90,15 +80,12 @@ class DatabasePool:
                 )
                 if current_dims and current_dims != expected_dims:
                     logger.error(
-                        "DIMENSIÓN MISMATCH: La tabla chunks tiene vector(%d) "
-                        "pero el proveedor '%s' requiere vector(%d). "
+                        "DIMENSIÓN MISMATCH: tabla tiene vector(%d), proveedor '%s' requiere vector(%d). "
                         "Ejecutá: bash scripts/reset_db.sh",
                         current_dims, config.LLM_PROVIDER, expected_dims
                     )
-                    # No fallar — permitir que el sistema arranque (sin embeddings válidos)
                     return
 
-            # Crear tablas
             await conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS documents (
                     id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -170,7 +157,7 @@ class DatabasePool:
                 );
             """)
 
-            # Índices (solo los que no existen)
+            # Índices — existentes
             await conn.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_chunks_embedding
                     ON chunks USING ivfflat (embedding vector_cosine_ops)
@@ -192,7 +179,27 @@ class DatabasePool:
                     ON generated_content (run_id);
             """)
 
-            # Función para marcar chunks usados (diversity tracking)
+            # NUEVO v3.0: Índices para entities y relationships (estilo LightRAG)
+            await conn.execute("""
+                -- Índice GIN sobre el array de entities para búsqueda rápida
+                -- Permite: WHERE metadata->'entities' @> '[{"name": "X"}]'
+                CREATE INDEX IF NOT EXISTS idx_chunks_entities
+                    ON chunks USING GIN ((metadata->'entities'));
+
+                -- Índice GIN sobre relationships
+                CREATE INDEX IF NOT EXISTS idx_chunks_relationships
+                    ON chunks USING GIN ((metadata->'relationships'));
+
+                -- Índice para filtrar por tipo de entidad
+                -- Útil para: "dame chunks con entidades de tipo Concepto Psicológico"
+                CREATE INDEX IF NOT EXISTS idx_chunks_entity_types
+                    ON chunks USING GIN (
+                        (SELECT jsonb_agg(e->>'type')
+                         FROM jsonb_array_elements(metadata->'entities') AS e)
+                    );
+            """)
+
+            # Función mark_chunk_used
             await conn.execute("""
                 CREATE OR REPLACE FUNCTION mark_chunk_used(p_chunk_id UUID)
                 RETURNS VOID AS $$
@@ -208,16 +215,12 @@ class DatabasePool:
             """)
 
         logger.info(
-            "DB inicializada: provider=%s, embedding_dims=%d",
+            "DB inicializada: provider=%s, embedding_dims=%d (con índices de entidades)",
             config.LLM_PROVIDER, expected_dims
         )
 
     @classmethod
     async def clear_database(cls) -> None:
-        """
-        Elimina todas las tablas. Útil al cambiar de proveedor (dims del vector).
-        En producción usar scripts/reset_db.sh que también hace backup.
-        """
         pool = await cls.get_pool()
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -231,7 +234,6 @@ class DatabasePool:
 
 
 async def _register_vector_codec(conn: asyncpg.Connection) -> None:
-    """Registra el codec para el tipo vector de pgvector."""
     await conn.set_type_codec(
         "vector",
         encoder=lambda v: "[" + ",".join(str(x) for x in v) + "]",
@@ -243,7 +245,6 @@ async def _register_vector_codec(conn: asyncpg.Connection) -> None:
 
 @asynccontextmanager
 async def get_db_connection():
-    """Context manager para obtener una conexión del pool."""
     pool = await DatabasePool.get_pool()
     async with pool.acquire() as conn:
         yield conn
@@ -268,7 +269,6 @@ async def insert_document(
     content: str,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Inserta un documento. Retorna el UUID del documento creado."""
     async with get_db_connection() as conn:
         doc_id = await conn.fetchval(
             """
@@ -291,7 +291,10 @@ async def insert_chunks(
     token_counts: Optional[List[int]] = None,
     metadata_list: Optional[List[Dict]] = None,
 ) -> None:
-    """Inserta chunks con sus embeddings en Postgres."""
+    """
+    Inserta chunks con embeddings y metadata enriquecida (incluyendo entities).
+    metadata_list debe tener la misma longitud que chunks.
+    """
     if token_counts is None:
         token_counts = [0] * len(chunks)
     if metadata_list is None:
@@ -318,7 +321,6 @@ async def insert_chunks(
 
 
 async def mark_document_graph_ingested(doc_id: str, episode_id: str) -> None:
-    """Marca un documento como ingresado en el grafo (Neo4j)."""
     async with get_db_connection() as conn:
         await conn.execute(
             """
@@ -331,3 +333,126 @@ async def mark_document_graph_ingested(doc_id: str, episode_id: str) -> None:
             episode_id,
             UUID(doc_id),
         )
+
+
+# =============================================================================
+# HELPERS DE ANÁLISIS DE ENTIDADES — NUEVO v3.0
+# =============================================================================
+
+async def get_entity_stats(limit: int = 20) -> list[dict]:
+    """
+    Retorna las entidades más frecuentes en el corpus.
+    Útil para el dashboard y para el Search Intent Generator.
+
+    Returns:
+        Lista de {name, type, chunk_count} ordenada por frecuencia descendente.
+    """
+    async with get_db_connection() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                e->>'name' AS entity_name,
+                e->>'type' AS entity_type,
+                COUNT(*) AS chunk_count
+            FROM chunks,
+                 jsonb_array_elements(metadata->'entities') AS e
+            WHERE jsonb_array_length(metadata->'entities') > 0
+              AND metadata->>'is_deleted' != 'true'
+            GROUP BY e->>'name', e->>'type'
+            ORDER BY chunk_count DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+
+    return [
+        {
+            "name": row["entity_name"],
+            "type": row["entity_type"],
+            "chunk_count": row["chunk_count"],
+        }
+        for row in rows
+    ]
+
+
+async def get_entity_co_occurrences(
+    entity_name: str,
+    limit: int = 10,
+) -> list[dict]:
+    """
+    Retorna las entidades que co-ocurren más frecuentemente con la entidad dada.
+    Útil para el Search Intent Generator: "si generamos sobre X, ¿qué más es relevante?"
+
+    Returns:
+        Lista de {name, type, co_occurrence_count}
+    """
+    async with get_db_connection() as conn:
+        rows = await conn.fetch(
+            """
+            WITH target_chunks AS (
+                -- Chunks que contienen la entidad objetivo
+                SELECT c.id
+                FROM chunks c
+                WHERE EXISTS (
+                    SELECT 1 FROM jsonb_array_elements(c.metadata->'entities') AS e
+                    WHERE lower(e->>'name') LIKE lower($1)
+                )
+            )
+            SELECT
+                e->>'name' AS entity_name,
+                e->>'type' AS entity_type,
+                COUNT(*) AS co_occurrence_count
+            FROM chunks c
+            JOIN target_chunks tc ON c.id = tc.id,
+                 jsonb_array_elements(c.metadata->'entities') AS e
+            WHERE lower(e->>'name') NOT LIKE lower($1)
+              AND jsonb_array_length(c.metadata->'entities') > 0
+            GROUP BY e->>'name', e->>'type'
+            ORDER BY co_occurrence_count DESC
+            LIMIT $2
+            """,
+            f"%{entity_name}%",
+            limit,
+        )
+
+    return [
+        {
+            "name": row["entity_name"],
+            "type": row["entity_type"],
+            "co_occurrence_count": row["co_occurrence_count"],
+        }
+        for row in rows
+    ]
+
+
+async def get_document_summary() -> list[dict]:
+    """Resumen de documentos para el dashboard (existente, mantenido)."""
+    async with get_db_connection() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                d.id,
+                d.title,
+                d.filename AS source,
+                d.created_at,
+                COUNT(c.id) AS chunk_count,
+                SUM(c.token_count) AS total_tokens,
+                (d.metadata->>'graph_ingested')::boolean AS graph_ingested,
+                (d.graphiti_episode_id IS NOT NULL) AS has_graphiti_node,
+                jsonb_array_length(
+                    COALESCE(
+                        (SELECT jsonb_agg(DISTINCT e->>'name')
+                         FROM chunks c2,
+                              jsonb_array_elements(c2.metadata->'entities') AS e
+                         WHERE c2.document_id = d.id),
+                        '[]'::jsonb
+                    )
+                ) AS entity_count
+            FROM documents d
+            LEFT JOIN chunks c ON c.document_id = d.id
+            GROUP BY d.id, d.title, d.filename, d.created_at, d.metadata, d.graphiti_episode_id
+            ORDER BY d.created_at DESC
+            """
+        )
+
+    return [dict(row) for row in rows]
