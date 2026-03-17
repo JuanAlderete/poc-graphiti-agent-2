@@ -112,7 +112,10 @@ async def check_postgres_credentials(req: PostgresCheckRequest) -> dict:
         version = result.split(" ")[1] if result else "?"
         return {"status": "ok", "message": f"Postgres conectado (v{version})"}
     except Exception as e:
-        return {"status": "error", "message": str(e)[:200]}
+        msg = str(e)
+        if "localhost" in req.host or "127.0.0.1" in req.host:
+            msg += ". Nota: Si la API corre en Docker, 'localhost' es el contenedor. Usar 'postgres' o 'host.docker.internal'."
+        return {"status": "error", "message": msg[:200]}
 
 
 @router.post("/check/telegram")

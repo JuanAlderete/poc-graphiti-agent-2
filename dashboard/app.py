@@ -13,8 +13,9 @@ from pyvis.network import Network
 # FIXED: patch the event loop so asyncio.run / await work inside Streamlit
 nest_asyncio.apply()
 
+from agent.config import settings
 from agent.db_utils import DatabasePool, get_document_summary
-from agent.tools import graph_search_tool, hybrid_search_tool, vector_search_tool
+from agent.tools import entity_search, hybrid_search, vector_search_with_diversity
 from poc.content_generator import get_content_generator
 from poc.logging_utils import (
     GENERATION_LOG_PATH,
@@ -104,6 +105,41 @@ def _check_service(endpoint: str, payload: dict) -> dict:
     except Exception as e:
         return {"status": "error", "message": str(e)[:200]}
 
+def _restart_services():
+    import subprocess
+    import sys
+    import os
+    import time
+    from agent.config import settings as _settings
+    
+    st.info(t("config.restarting", lang))
+    time.sleep(1)
+    
+    # Intentar matar uvicorn (backend)
+    try:
+        if os.name == 'nt':
+            subprocess.run("taskkill /F /IM uvicorn.exe /T", shell=True, capture_output=True)
+        else:
+            subprocess.run("pkill -f uvicorn", shell=True, capture_output=True)
+    except:
+        pass
+
+    # Levantar uvicorn de nuevo
+    port = str(getattr(_settings, "API_PORT", 8000))
+    cmd_uvicorn = [sys.executable, "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", port, "--reload"]
+    
+    try:
+        subprocess.Popen(cmd_uvicorn, creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0)
+    except Exception as e:
+        st.error(f"Error levantando uvicorn: {e}")
+        return
+
+    # Reiniciar Streamlit
+    try:
+        os.execv(sys.executable, [sys.executable, "-m", "streamlit", "run", "dashboard/app.py"])
+    except Exception as e:
+        st.error(f"Error reiniciando dashboard: {e}")
+
 # ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
@@ -154,7 +190,7 @@ with st.sidebar:
     # Language selector
     st.subheader(_("sidebar.language"))
     selected_lang_label = st.radio(
-        label="",
+        label="Language Selection",
         options=list(LANGUAGES.keys()),
         index=list(LANGUAGES.values()).index(st.session_state["lang"]),
         horizontal=True,
@@ -179,12 +215,16 @@ with st.sidebar:
         st.rerun()
 
     if st.button(t("sidebar.hydrate_btn", lang), help=t("sidebar.hydrate_help", lang)):
-        with st.spinner(t("sidebar.hydrate_spinner", lang)):
-            try:
-                run_async(hydrate_graph(reset_flags=True))
-                st.success(t("sidebar.hydrate_ok", lang))
-            except Exception as e:
-                st.error(t("sidebar.hydrate_err", lang, e=e))
+        from agent.config import settings as _cfg
+        if not _cfg.ENABLE_GRAPH:
+            st.warning("⚠️ El grafo está desactivado en la configuración (`ENABLE_GRAPH=false`). Activalo primero.")
+        else:
+            with st.spinner(t("sidebar.hydrate_spinner", lang)):
+                try:
+                    run_async(hydrate_graph(reset_flags=True))
+                    st.success(t("sidebar.hydrate_ok", lang))
+                except Exception as e:
+                    st.error(t("sidebar.hydrate_err", lang, e=e))
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +255,7 @@ with tab_ingest:
 
     skip_graphiti_global = st.checkbox(
         t("ingest.skip_graphiti", lang),
-        value=True,
+        value=not getattr(settings, "ENABLE_GRAPH", False),
         help=t("ingest.skip_graphiti_help", lang),
     )
 
@@ -308,6 +348,10 @@ with tab_kb:
             st.info(t("kb.no_docs", lang))
         else:
             df_docs = pd.DataFrame(docs)
+            # Ensure all object columns (like UUIDs) are strings for Arrow serialization
+            for col in df_docs.columns:
+                if df_docs[col].dtype == "object":
+                    df_docs[col] = df_docs[col].astype(str)
             total_docs = len(df_docs)
             total_chunks = df_docs["chunk_count"].sum() if "chunk_count" in df_docs.columns else 0
 
@@ -359,18 +403,18 @@ with tab_search:
                 # Map display label back to function (works for both languages)
                 _type_lower = search_type.lower()
                 if _type_lower in ("vector",):
-                    results = run_async(vector_search_tool(query))
+                    results = run_async(vector_search_with_diversity(None, query_embedding=run_async(get_content_generator()._get_embedding(query))))
                 elif _type_lower in ("graph", "grafo"):
-                    results = run_async(graph_search_tool(query))
+                    results = run_async(entity_search([query]))
                 else:
-                    results = run_async(hybrid_search_tool(query))
+                    results = run_async(hybrid_search(query, query_embedding=run_async(get_content_generator()._get_embedding(query))))
 
                 st.subheader(t("search.results", lang, n=len(results)))
 
                 debug_mode = st.checkbox(t("search.debug", lang), value=False)
 
                 for i, r in enumerate(results, 1):
-                    with st.expander(f"#{i} — {t('search.score', lang)} {r.score:.3f} [{r.source}]"):
+                    with st.expander(f"#{i} — {t('search.score', lang)} {r.score:.3f} [{r.document_title}]"):
                         st.markdown(r.content)
                         if debug_mode:
                             st.caption(t("search.raw_data", lang))
@@ -485,7 +529,10 @@ with tab_gen:
                 from poc.budget_guard import get_budget_summary
 
                 if not new_context:
-                    results = run_async(hybrid_search_tool(new_topic, limit=3))
+                    # Usamos hybrid_search con la extracción de embedding automática
+                    gen = get_content_generator()
+                    q_emb = run_async(gen._get_embedding(new_topic))
+                    results = run_async(hybrid_search(new_topic, query_embedding=q_emb, limit=3))
                     context_for_gen = "\n\n---\n\n".join(r.content for r in results) if results else t("gen.no_context_fallback", lang)
                 else:
                     context_for_gen = new_context
@@ -718,180 +765,152 @@ def _neo4j_single(driver, cypher):
 
 with tab_neo4j:
     st.header(t("neo4j.header", lang))
-    from agent.config import settings as _neo4j_cfg
-    _effective_neo4j_uri = _neo4j_cfg.NEO4J_URI.replace("neo4j://", "bolt://", 1)
-    st.caption(t("neo4j.connected", lang, uri=_effective_neo4j_uri))
 
-    try:
-        _driver = _neo4j_driver()
-        _driver.verify_connectivity()
-    except Exception as exc:
-        st.error(t("neo4j.error", lang, e=exc))
+    if not settings.ENABLE_GRAPH:
+        st.info(t("neo4j.disabled_info", lang))
+    else:
+        _effective_neo4j_uri = settings.NEO4J_URI.replace("neo4j://", "bolt://", 1)
+        st.caption(t("neo4j.connected", lang, uri=_effective_neo4j_uri))
+
         _driver = None
+        try:
+            _driver = _neo4j_driver()
+            _driver.verify_connectivity()
+        except Exception as exc:
+            st.error(t("neo4j.error", lang, e=exc))
+            _driver = None
 
-    if _driver:
-        n_nodes = _neo4j_single(_driver, "MATCH (n) RETURN count(n) AS c")["c"]
-        n_rels = _neo4j_single(_driver, "MATCH ()-[r]->() RETURN count(r) AS c")["c"]
-        lbl_data = _neo4j_query(_driver,
-            "MATCH (n) UNWIND labels(n) AS label "
-            "RETURN label, count(*) AS count ORDER BY count DESC")
-        n_episodes = next((l["count"] for l in lbl_data if l["label"] == "Episodic"), 0)
+        if _driver:
+            n_nodes = _neo4j_single(_driver, "MATCH (n) RETURN count(n) AS c")["c"]
+            n_rels = _neo4j_single(_driver, "MATCH ()-[r]->() RETURN count(r) AS c")["c"]
+            lbl_data = _neo4j_query(_driver,
+                "MATCH (n) UNWIND labels(n) AS label "
+                "RETURN label, count(*) AS count ORDER BY count DESC")
+            n_episodes = next((l["count"] for l in lbl_data if l["label"] == "Episodic"), 0)
 
-        sc1, sc2, sc3, sc4 = st.columns(4)
-        sc1.metric(t("neo4j.nodes", lang), n_nodes)
-        sc2.metric(t("neo4j.rels", lang), n_rels)
-        sc3.metric(t("neo4j.episodes", lang), n_episodes)
-        sc4.metric(t("neo4j.entity_types", lang), next((l["count"] for l in lbl_data if l["label"] == "Entity"), 0))
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            sc1.metric(t("neo4j.nodes", lang), n_nodes)
+            sc2.metric(t("neo4j.rels", lang), n_rels)
+            sc3.metric(t("neo4j.episodes", lang), n_episodes)
+            sc4.metric(t("neo4j.entity_types", lang), next((l["count"] for l in lbl_data if l["label"] == "Entity"), 0))
 
-        neo_tab_graph, neo_tab_episodes, neo_tab_details, neo_tab_query = st.tabs([
-            t("neo4j.subtab_graph", lang),
-            t("neo4j.subtab_episodes", lang),
-            t("neo4j.subtab_details", lang),
-            t("neo4j.subtab_query", lang),
-        ])
+            neo_tab_graph, neo_tab_episodes, neo_tab_details, neo_tab_query = st.tabs([
+                t("neo4j.subtab_graph", lang),
+                t("neo4j.subtab_episodes", lang),
+                t("neo4j.subtab_details", lang),
+                t("neo4j.subtab_query", lang),
+            ])
 
-        # ── Interactive Graph ────────────────────────────────────────────────
-        with neo_tab_graph:
-            gcol1, gcol2 = st.columns([1, 4])
-            with gcol1:
-                _all_label = t("neo4j.filter_all", lang)
-                label_options = [_all_label] + [l["label"] for l in lbl_data]
-                lbl_filter = st.selectbox(t("neo4j.filter_label", lang), label_options, key="neo_lbl")
-                max_nodes = st.slider(t("neo4j.max_nodes", lang), 10, 500, 100, key="neo_max")
-                physics_on = st.checkbox(t("neo4j.physics", lang), True, key="neo_phys")
+            with neo_tab_graph:
+                gcol1, gcol2 = st.columns([1, 4])
+                with gcol1:
+                    _all_label = t("neo4j.filter_all", lang)
+                    label_options = [_all_label] + [l["label"] for l in lbl_data]
+                    lbl_filter = st.selectbox(t("neo4j.filter_label", lang), label_options, key="neo_lbl")
+                    max_nodes = st.slider(t("neo4j.max_nodes", lang), 10, 500, 100, key="neo_max")
+                    physics_on = st.checkbox(t("neo4j.physics", lang), True, key="neo_phys")
 
-            with gcol2:
-                if n_nodes == 0:
-                    st.warning(t("neo4j.no_nodes", lang))
-                else:
-                    with st.spinner(t("neo4j.building", lang)):
-                        if lbl_filter != _all_label:
-                            nodes_q = f"MATCH (n:{lbl_filter}) RETURN n, labels(n) AS labels LIMIT $lim"
-                        else:
-                            nodes_q = "MATCH (n) RETURN n, labels(n) AS labels LIMIT $lim"
-                        raw_nodes = _neo4j_query(_driver, nodes_q, lim=max_nodes)
-
-                        rels_q = (
-                            "MATCH (a)-[r]->(b) "
-                            "RETURN a.uuid AS a_uuid, a.name AS a_name, labels(a) AS a_labels, "
-                            "       b.uuid AS b_uuid, b.name AS b_name, labels(b) AS b_labels, "
-                            "       type(r) AS rel_type, properties(r) AS rel_props "
-                            "LIMIT $lim"
-                        )
-                        raw_rels = _neo4j_query(_driver, rels_q, lim=max_nodes * 2)
-
-                        net = Network(
-                            height="650px", width="100%",
-                            bgcolor="#1a1a2e", font_color="white",
-                            directed=True, notebook=False,
-                        )
-                        if physics_on:
-                            net.force_atlas_2based(
-                                gravity=-50, central_gravity=0.01,
-                                spring_length=150, spring_strength=0.08, damping=0.4,
-                            )
-                        else:
-                            net.toggle_physics(False)
-
-                        seen = set()
-
-                        def _add_node(nid, name, labels_list):
-                            if nid in seen:
-                                return
-                            seen.add(nid)
-                            pl = labels_list[0] if labels_list else t("neo4j.unknown", lang)
-                            color = _NEO4J_LABEL_COLORS.get(pl, _NEO4J_DEFAULT_COLOR)
-                            sz = 25 if pl == "Episodic" else 18
-                            net.add_node(
-                                nid, label=str(name or "?")[:30],
-                                title=f"<b>{name}</b><br>{t('neo4j.label', lang)}: {pl}",
-                                color=color, size=sz,
-                                font={"size": 12, "color": "white"},
-                            )
-
-                        for r in raw_rels:
-                            a_id = r["a_uuid"] or r["a_name"] or "a?"
-                            b_id = r["b_uuid"] or r["b_name"] or "b?"
-                            _add_node(a_id, r["a_name"], r["a_labels"])
-                            _add_node(b_id, r["b_name"], r["b_labels"])
-
-                            props = r.get("rel_props") or {}
-                            fact = str(props.get("fact", ""))[:200]
-                            title = f"<b>{r['rel_type']}</b>"
-                            if fact:
-                                title += f"<br>{fact}"
-
-                            net.add_edge(
-                                a_id, b_id,
-                                title=title,
-                                label=r["rel_type"][:20],
-                                color="#78909C", arrows="to",
-                                font={"size": 8, "color": "#aaa"},
-                            )
-
-                        for rec in raw_nodes:
-                            n = rec["n"]
-                            nid = n.get("uuid") or n.get("name") or str(id(n))
-                            _add_node(nid, n.get("name"), rec["labels"])
-
-                        with tempfile.NamedTemporaryFile(
-                            delete=False, suffix=".html", mode="w", encoding="utf-8"
-                        ) as tmp:
-                            net.save_graph(tmp.name)
-                            with open(tmp.name, "r", encoding="utf-8") as fh:
-                                html = fh.read()
-                            st.components.v1.html(html, height=680, scrolling=False)
-
-                        st.caption(t("neo4j.showing", lang, n=len(seen), r=len(raw_rels)))
-
-        # ── Episodes ─────────────────────────────────────────────────────────
-        with neo_tab_episodes:
-            eps = _neo4j_query(_driver,
-                "MATCH (e) WHERE 'Episodic' IN labels(e) "
-                "RETURN e.name AS name, e.created_at AS created, "
-                "e.group_id AS group_id, e.source_description AS source "
-                "ORDER BY e.created_at")
-            if eps:
-                st.subheader(t("neo4j.episodes_header", lang, n=len(eps)))
-                for ep in eps:
-                    with st.expander(ep.get("name") or "unnamed"):
-                        st.json(ep)
-            else:
-                st.info(t("neo4j.no_episodes", lang))
-
-        # ── Details ──────────────────────────────────────────────────────────
-        with neo_tab_details:
-            dc1, dc2 = st.columns(2)
-            with dc1:
-                st.subheader(t("neo4j.node_labels", lang))
-                for l in lbl_data:
-                    clr = _NEO4J_LABEL_COLORS.get(l["label"], _NEO4J_DEFAULT_COLOR)
-                    st.markdown(
-                        f'<span style="color:{clr};font-weight:600">{l["label"]}</span>: {l["count"]}',
-                        unsafe_allow_html=True)
-            with dc2:
-                st.subheader(t("neo4j.rel_types", lang))
-                rel_types = _neo4j_query(_driver,
-                    "MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count ORDER BY count DESC")
-                for rt in rel_types:
-                    st.markdown(f'`{rt["type"]}`: {rt["count"]}')
-
-        # ── Custom Query ─────────────────────────────────────────────────────
-        with neo_tab_query:
-            st.subheader(t("neo4j.cypher_header", lang))
-            default_cypher = "MATCH (n) RETURN n.name AS name, labels(n) AS labels LIMIT 25"
-            cypher = st.text_area(t("neo4j.cypher_label", lang), value=default_cypher, height=100, key="neo_cypher")
-            if st.button(t("neo4j.cypher_btn", lang), key="neo_exec"):
-                try:
-                    result = _neo4j_query(_driver, cypher)
-                    if result:
-                        st.dataframe(result, width="stretch")
+                with gcol2:
+                    if n_nodes == 0:
+                        st.warning(t("neo4j.no_nodes", lang))
                     else:
-                        st.info(t("neo4j.cypher_no_results", lang))
-                except Exception as qe:
-                    st.error(t("neo4j.cypher_error", lang, e=qe))
+                        with st.spinner(t("neo4j.building", lang)):
+                            if lbl_filter != _all_label:
+                                nodes_q = f"MATCH (n:{lbl_filter}) RETURN n, labels(n) AS labels LIMIT $lim"
+                            else:
+                                nodes_q = "MATCH (n) RETURN n, labels(n) AS labels LIMIT $lim"
+                            raw_nodes = _neo4j_query(_driver, nodes_q, lim=max_nodes)
 
-        _driver.close()
+                            rels_q = (
+                                "MATCH (a)-[r]->(b) "
+                                "RETURN a.uuid AS a_uuid, a.name AS a_name, labels(a) AS a_labels, "
+                                "       b.uuid AS b_uuid, b.name AS b_name, labels(b) AS b_labels, "
+                                "       type(r) AS rel_type, properties(r) AS rel_props "
+                                "LIMIT $lim"
+                            )
+                            raw_rels = _neo4j_query(_driver, rels_q, lim=max_nodes * 2)
+
+                            net = Network(height="650px", width="100%", bgcolor="#1a1a2e", font_color="white", directed=True, notebook=False)
+                            if physics_on:
+                                net.force_atlas_2based(gravity=-50, central_gravity=0.01, spring_length=150, spring_strength=0.08, damping=0.4)
+                            else:
+                                net.toggle_physics(False)
+
+                            seen = set()
+
+                            def _add_node(nid, name, labels_list):
+                                if nid in seen:
+                                    return
+                                seen.add(nid)
+                                pl = labels_list[0] if labels_list else t("neo4j.unknown", lang)
+                                color = _NEO4J_LABEL_COLORS.get(pl, _NEO4J_DEFAULT_COLOR)
+                                sz = 25 if pl == "Episodic" else 18
+                                net.add_node(nid, label=str(name or "?")[:30], title=f"<b>{name}</b><br>{t('neo4j.label', lang)}: {pl}", color=color, size=sz, font={"size": 12, "color": "white"})
+
+                            for r in raw_rels:
+                                a_id = r["a_uuid"] or r["a_name"] or "a?"
+                                b_id = r["b_uuid"] or r["b_name"] or "b?"
+                                _add_node(a_id, r["a_name"], r["a_labels"])
+                                _add_node(b_id, r["b_name"], r["b_labels"])
+                                props = r.get("rel_props") or {}
+                                fact = str(props.get("fact", ""))[:200]
+                                title = f"<b>{r['rel_type']}</b>"
+                                if fact: title += f"<br>{fact}"
+                                net.add_edge(a_id, b_id, title=title, label=r["rel_type"][:20], color="#78909C", arrows="to", font={"size": 8, "color": "#aaa"})
+
+                            for rec in raw_nodes:
+                                n = rec["n"]
+                                nid = n.get("uuid") or n.get("name") or str(id(n))
+                                _add_node(nid, n.get("name"), rec["labels"])
+
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w", encoding="utf-8") as tmp:
+                                net.save_graph(tmp.name)
+                                with open(tmp.name, "r", encoding="utf-8") as fh:
+                                    html = fh.read()
+                                st.components.v1.html(html, height=680, scrolling=False)
+
+                            st.caption(t("neo4j.showing", lang, n=len(seen), r=len(raw_rels)))
+
+            with neo_tab_episodes:
+                eps = _neo4j_query(_driver, "MATCH (e) WHERE 'Episodic' IN labels(e) RETURN e.name AS name, e.created_at AS created, e.group_id AS group_id, e.source_description AS source ORDER BY e.created_at")
+                if eps:
+                    st.subheader(t("neo4j.episodes_header", lang, n=len(eps)))
+                    for ep in eps:
+                        with st.expander(ep.get("name") or "unnamed"):
+                            st.json(ep)
+                else:
+                    st.info(t("neo4j.no_episodes", lang))
+
+            with neo_tab_details:
+                dc1, dc2 = st.columns(2)
+                with dc1:
+                    st.subheader(t("neo4j.node_labels", lang))
+                    for l in lbl_data:
+                        clr = _NEO4J_LABEL_COLORS.get(l["label"], _NEO4J_DEFAULT_COLOR)
+                        st.markdown(f'<span style="color:{clr};font-weight:600">{l["label"]}</span>: {l["count"]}', unsafe_allow_html=True)
+                with dc2:
+                    st.subheader(t("neo4j.rel_types", lang))
+                    rel_types = _neo4j_query(_driver, "MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count ORDER BY count DESC")
+                    for rt in rel_types:
+                        st.markdown(f'`{rt["type"]}`: {rt["count"]}')
+
+            with neo_tab_query:
+                st.subheader(t("neo4j.cypher_header", lang))
+                cypher = st.text_area(t("neo4j.cypher_label", lang), value="MATCH (n) RETURN n.name AS name, labels(n) AS labels LIMIT 25", height=100, key="neo_cypher")
+                if st.button(t("neo4j.cypher_btn", lang), key="neo_exec"):
+                    try:
+                        result = _neo4j_query(_driver, cypher)
+                        if result:
+                            df_res = pd.DataFrame(result)
+                            for col in df_res.columns:
+                                if df_res[col].dtype == "object": df_res[col] = df_res[col].astype(str)
+                            st.dataframe(df_res, width="stretch")
+                        else:
+                            st.info(t("neo4j.cypher_no_results", lang))
+                    except Exception as qe:
+                        st.error(t("neo4j.cypher_error", lang, e=qe))
+
+            _driver.close()
 
 # ── TAB CONFIGURACIÓN ────────────────────────────────────────────────────────
 with tab_config:
@@ -1287,6 +1306,15 @@ with tab_config:
             "Necesitás reiniciar `uvicorn api.main:app` y `streamlit run dashboard/app.py` para que tomen efecto."
         )
     
+    st.divider()
+
+    # ── Sección 3: Reinicio de Servicios ─────────────────────────────────
+    st.subheader(f"🔄 {t('config.restart_btn', lang)}")
+    st.info(t("config.restart_info", lang))
+    
+    if st.button(t("config.restart_btn", lang), key="btn_restart_services"):
+        _restart_services()
+
     # Mostrar el .env actual (sin passwords)
     with st.expander("👁️ Ver configuración actual (.env sanitizado)"):
         env_display = {

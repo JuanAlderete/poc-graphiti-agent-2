@@ -31,11 +31,16 @@ class DatabasePool:
                 cls._loop = None
 
         if cls._pool is None:
+            db_host = config.POSTGRES_HOST
+            # Fix para Windows/Docker: localhost a veces resuelve IPv6 ::1 y falla
+            if db_host == "localhost":
+                db_host = "127.0.0.1"
+
             cls._pool = await asyncpg.create_pool(
                 user=config.POSTGRES_USER,
                 password=config.POSTGRES_PASSWORD,
                 database=config.POSTGRES_DB,
-                host=config.POSTGRES_HOST,
+                host=db_host,
                 port=config.POSTGRES_PORT,
                 min_size=2,
                 max_size=10,
@@ -61,12 +66,29 @@ class DatabasePool:
         Inicializa extensiones y crea tablas + índices.
         NUEVO v3.0: agrega índices GIN para entities y relationships.
         """
+        # 1. Asegurar extensiones usando una conexión cruda (sin codec de vector)
+        db_host = config.POSTGRES_HOST
+        if db_host == "localhost":
+            db_host = "127.0.0.1"
+
+        conn = await asyncpg.connect(
+            user=config.POSTGRES_USER,
+            password=config.POSTGRES_PASSWORD,
+            database=config.POSTGRES_DB,
+            host=db_host,
+            port=config.POSTGRES_PORT,
+        )
+        try:
+            for ext in ("vector", "uuid-ossp", "pg_trgm"):
+                await conn.execute(f'CREATE EXTENSION IF NOT EXISTS "{ext}";')
+        finally:
+            await conn.close()
+
+        # 2. Ahora sí podemos crear el pool con el codec de vector registrado
         pool = await cls.get_pool()
         expected_dims = config.EMBEDDING_DIMS
 
         async with pool.acquire() as conn:
-            for ext in ("vector", "uuid-ossp", "pg_trgm"):
-                await conn.execute(f'CREATE EXTENSION IF NOT EXISTS "{ext}";')
 
             table_exists = await conn.fetchval(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
@@ -238,7 +260,7 @@ async def _register_vector_codec(conn: asyncpg.Connection) -> None:
         "vector",
         encoder=lambda v: "[" + ",".join(str(x) for x in v) + "]",
         decoder=lambda s: [float(x) for x in s.strip("[]").split(",")],
-        schema="pg_catalog",
+        schema="public",
         format="text",
     )
 

@@ -72,6 +72,9 @@ class GraphClient:
 
     @classmethod
     def get_client(cls) -> Graphiti:
+        if not settings.ENABLE_GRAPH:
+            raise RuntimeError("Graphiti is disabled (ENABLE_GRAPH=false in .env)")
+
         if cls._client is not None:
             return cls._client
 

@@ -252,6 +252,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
     # ── Neo4j tab ────────────────────────────────────────────────────────────
     "neo4j.header": {"es": "Explorador de Grafo Neo4j", "en": "Neo4j Graph Explorer"},
     "neo4j.connected": {"es": "Conectado a: `{uri}`", "en": "Connected to: `{uri}`"},
+    "neo4j.disabled_info": {
+        "es": "🔵 **Grafo de Neo4j desactivado.** Puedes activarlo en la pestaña de ⚙️ **Configuración** si tienes Neo4j corriendo (Fase 2).",
+        "en": "🔵 **Neo4j Graph disabled.** You can enable it in the ⚙️ **Configuration** tab if you have Neo4j running (Phase 2).",
+    },
+    "config.restart_btn": {"es": "Reiniciar Servicios (FastAPI & Streamlit)", "en": "Restart Services (FastAPI & Streamlit)"},
+    "config.restart_info": {"es": "Esto reiniciará tanto el backend como el dashboard para aplicar cambios en .env.", "en": "This will restart both the backend and the dashboard to apply changes in .env."},
+    "config.restarting": {"es": "Reiniciando servicios... Por favor, espera unos segundos.", "en": "Restarting services... Please wait a few seconds."},
     "neo4j.error": {"es": "No se puede conectar a Neo4j: {e}", "en": "Cannot connect to Neo4j: {e}"},
     "neo4j.nodes": {"es": "Nodos", "en": "Nodes"},
     "neo4j.rels": {"es": "Relaciones", "en": "Relationships"},

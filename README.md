@@ -262,7 +262,15 @@ curl -X POST http://localhost:8000/generate/weekly \
 
 ## Configuración desde el Dashboard (Streamlit)
 
-La versión v3.0 actual introduce una Pestaña de **Configuración Interactiva** accesible desde el navegador web mediante Streamlit. Esta interfaz permite gestionar las principales credenciales e integraciones sin necesidad de conocimientos de programación, alterando dinámicamente el archivo interno `.env`.
+La versión v3.1 introduce mejoras críticas en la gestión del ciclo de vida de la aplicación:
+
+### Funcionalidades del Dashboard v3.1:
+1. **Gestor de Configuración Dinámico:** Permite modificar el `.env` en tiempo real para cambiar proveedores de LLM, credenciales de bases de datos y tokens de Notion/Telegram.
+2. **Healthchecks Interactivos:** Botones para verificar instantáneamente la conectividad con OpenAI, Ollama, Gemini, PostgreSQL y Neo4j.
+3. **Botón de Reinicio de Servicios (NUEVO):** Un control centralizado para reiniciar tanto el backend (`uvicorn`) como el frontend (`streamlit`). Esto asegura que cambios críticos en el entorno (como el `LLM_PROVIDER`) se apliquen sin intervención manual en la terminal.
+4. **Traducciones (v3.1):** Soporte completo i18n para Español e Inglés en toda la interfaz de configuración y logs.
+
+_**Nota:** Gracias al nuevo Botón de Reinicio, ya no es necesario cerrar manualmente los procesos en la terminal al guardar cambios en la configuración._
 
 ### Opciones configurables desde el Dashboard:
 1. **Proveedor LLM y Credenciales:** Permite elegir entre OpenAI (con su respectiva base_URL para proxies), Ollama local o Google Gemini. Proporciona además campos seguros para ingresar y ocultar las API Keys y verificar su validez conectándose directamente con los servidores de estos proveedores.
