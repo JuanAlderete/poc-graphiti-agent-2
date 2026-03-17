@@ -9,7 +9,7 @@ WORKDIR /app
 
 # Install runtime system dependencies (libpq for asyncpg)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 \
+    libpq5 curl \
     && rm -rf /var/lib/apt/lists/*
 
 # ─── Stage 2: Builder ───────────────────────────────────────────────────────

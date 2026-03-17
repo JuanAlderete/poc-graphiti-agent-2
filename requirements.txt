@@ -38,6 +38,7 @@ streamlit>=1.30.0
 plotly>=5.18.0
 nest_asyncio>=1.6.0
 pandas>=2.0.0
+pyvis>=0.3.2
 
 # --- Testing ---
 pytest==8.4.1

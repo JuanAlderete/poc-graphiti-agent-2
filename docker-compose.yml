@@ -111,7 +111,7 @@ services:
     container_name: marketingmaker_dashboard
     restart: unless-stopped
     ports:
-      - "${DASHBOARD_PORT:-8501}:8501"
+      - "${DASHBOARD_PORT:-8502}:8501"
     environment:
       LLM_PROVIDER:      ${LLM_PROVIDER:-openai}
       OPENAI_API_KEY:    ${OPENAI_API_KEY:-ollama}

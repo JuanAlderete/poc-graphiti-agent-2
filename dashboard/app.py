@@ -10,6 +10,13 @@ import neo4j
 from neo4j import GraphDatabase
 from pyvis.network import Network
 
+# FIXED: ensure standard event loop if uvloop is installed
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+except ImportError:
+    pass
+
 # FIXED: patch the event loop so asyncio.run / await work inside Streamlit
 nest_asyncio.apply()
 
