@@ -206,3 +206,4 @@ secrets/
 *.yml
 *.yaml
 repomix-output.*
+.agents
