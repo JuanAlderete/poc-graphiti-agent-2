@@ -1083,8 +1083,8 @@ with tab_config:
     col_pg1, col_pg2 = st.columns(2)
     with col_pg1:
         pg_host = st.text_input("Host", value=current_env.get("POSTGRES_HOST", "localhost"), key="cfg_pg_host")
-        pg_db   = st.text_input("Database", value=current_env.get("POSTGRES_DB", "novolabs"), key="cfg_pg_db")
-        pg_user = st.text_input("Usuario", value=current_env.get("POSTGRES_USER", "novolabs"), key="cfg_pg_user")
+        pg_db   = st.text_input("Database", value=current_env.get("POSTGRES_DB", "marketingmaker"), key="cfg_pg_db")
+        pg_user = st.text_input("Usuario", value=current_env.get("POSTGRES_USER", "marketingmaker"), key="cfg_pg_user")
     with col_pg2:
         pg_port = st.number_input("Puerto", value=int(current_env.get("POSTGRES_PORT", "5432")), min_value=1, max_value=65535, key="cfg_pg_port")
         pg_pass = st.text_input("Password", value=current_env.get("POSTGRES_PASSWORD", ""), type="password", key="cfg_pg_pass")

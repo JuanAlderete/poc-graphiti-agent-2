@@ -1,4 +1,4 @@
-# Plan de Implementación: POC de Validación Económica Novolabs
+# Plan de Implementación: POC de Validación Económica MarketingMaker
 
 ## Objetivo
 

@@ -26,7 +26,7 @@ class IngestRequest(BaseModel):
                 "content": "# Sesión 14\nEn esta sesión trabajamos la validación de ideas...",
                 "source_type": "sesion_grupal",
                 "skip_graphiti": True,
-                "organization_id": "novolabs",
+                "organization_id": "marketingmaker",
                 "extra": {"edition": 14, "alumno_id": "juan-garcia"}
             }
         }

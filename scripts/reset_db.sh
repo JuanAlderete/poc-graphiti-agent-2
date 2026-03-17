@@ -34,15 +34,15 @@ if [ -f ".env" ]; then
 fi
 
 PROVIDER="${LLM_PROVIDER:-openai}"
-PG_USER="${POSTGRES_USER:-novolabs}"
-PG_DB="${POSTGRES_DB:-novolabs}"
+PG_USER="${POSTGRES_USER:-marketingmaker}"
+PG_DB="${POSTGRES_DB:-marketingmaker}"
 PG_HOST="${POSTGRES_HOST:-localhost}"
 PG_PORT="${POSTGRES_PORT:-5432}"
 BACKUP_DIR="backups"
 
 echo ""
 echo "======================================================"
-echo "  NOVOLABS DB RESET"
+echo "  MARKETINGMAKER DB RESET"
 echo "======================================================"
 echo "  Proveedor:     $PROVIDER"
 echo "  Base de datos: $PG_DB @ $PG_HOST:$PG_PORT"
@@ -75,15 +75,15 @@ BACKUP_FILE="$BACKUP_DIR/backup_$(date +%Y%m%d_%H%M%S)_before_${PROVIDER}_reset.
 echo ""
 echo "📦 Haciendo backup en $BACKUP_FILE ..."
 
-if docker ps --format '{{.Names}}' | grep -q "novolabs_postgres"; then
-    docker exec novolabs_postgres pg_dump \
+if docker ps --format '{{.Names}}' | grep -q "marketingmaker_postgres"; then
+    docker exec marketingmaker_postgres pg_dump \
         -U "$PG_USER" \
         -d "$PG_DB" \
         --no-owner \
         --no-acl \
         -f "/tmp/backup.sql" 2>/dev/null || true
 
-    docker cp novolabs_postgres:/tmp/backup.sql "$BACKUP_FILE" 2>/dev/null || true
+    docker cp marketingmaker_postgres:/tmp/backup.sql "$BACKUP_FILE" 2>/dev/null || true
     echo "✅ Backup guardado en $BACKUP_FILE"
 else
     echo "⚠️  Postgres no está corriendo en Docker. Saltando backup."
@@ -93,7 +93,7 @@ fi
 echo ""
 echo "🗑️  Eliminando tablas..."
 
-PSQL_CMD="docker exec -e PGPASSWORD=$POSTGRES_PASSWORD novolabs_postgres psql -U $PG_USER -d $PG_DB"
+PSQL_CMD="docker exec -e PGPASSWORD=$POSTGRES_PASSWORD marketingmaker_postgres psql -U $PG_USER -d $PG_DB"
 
 $PSQL_CMD -c "
     DROP TABLE IF EXISTS token_usage CASCADE;
@@ -118,8 +118,8 @@ echo "   1. Asegurarte de que .env tiene LLM_PROVIDER=$PROVIDER"
 if [ "$PROVIDER" = "ollama" ]; then
 echo "   2. Levantar Ollama: docker compose --profile local up -d"
 echo "   3. Descargar modelos:"
-echo "      docker exec novolabs_ollama ollama pull llama3.1:8b"
-echo "      docker exec novolabs_ollama ollama pull nomic-embed-text"
+echo "      docker exec marketingmaker_ollama ollama pull llama3.1:8b"
+echo "      docker exec marketingmaker_ollama ollama pull nomic-embed-text"
 echo "   4. Levantar API:    docker compose up -d api"
 else
 echo "   2. Levantar servicios: docker compose up -d"

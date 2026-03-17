@@ -1,7 +1,7 @@
 """
 api/main.py
 -----------
-Entry point de la aplicación FastAPI — Novolabs AI Engine.
+Entry point de la aplicación FastAPI — MarketingMaker AI Engine.
 
 Arranca con:
     uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
     """
     # ── Startup ───────────────────────────────────────────────────────────────
     logger.info(
-        "Novolabs AI Engine arrancando — provider=%s model=%s dims=%d env=%s",
+        "MarketingMaker AI Engine arrancando — provider=%s model=%s dims=%d env=%s",
         config.LLM_PROVIDER,
         config.DEFAULT_MODEL,
         config.EMBEDDING_DIMS,
@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
     yield  # ← La app corre aquí
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
-    logger.info("Cerrando Novolabs AI Engine...")
+    logger.info("Cerrando MarketingMaker AI Engine...")
     await DatabasePool.close()
     logger.info("Pool de Postgres cerrado. Bye!")
 
@@ -77,7 +77,7 @@ async def lifespan(app: FastAPI):
 # =============================================================================
 
 app = FastAPI(
-    title="Novolabs AI Engine",
+    title="MarketingMaker AI Engine",
     description=(
         "Sistema de generación automatizada de contenido semanal. "
         "Ingesta transcripciones → genera reels, historias, emails y ads → publica en Notion."
@@ -129,7 +129,7 @@ app.include_router(config_check_router)
 @app.get("/", tags=["Sistema"], include_in_schema=False)
 async def root():
     return {
-        "name":    "Novolabs AI Engine",
+        "name":    "MarketingMaker AI Engine",
         "version": "1.0.0",
         "docs":    "/docs",
         "health":  "/health",

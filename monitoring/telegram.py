@@ -116,7 +116,7 @@ class TelegramNotifier:
     async def notify_error(self, context: str, error: str) -> None:
         """Notifica un error crítico."""
         msg = (
-            f"🚨 *Error en Novolabs AI Engine*\n\n"
+            f"🚨 *Error en MarketingMaker AI Engine*\n\n"
             f"📍 Contexto: {context}\n"
             f"❌ Error: `{error[:300]}`"
         )

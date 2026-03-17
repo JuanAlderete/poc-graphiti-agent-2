@@ -1,4 +1,4 @@
-# Novolabs AI Engine — Roadmap MVP
+# MarketingMaker AI Engine — Roadmap MVP
 
 > **Objetivo:** Sistema de generación de contenido semanal automatizado, listo para vender como servicio gestionado a empresas.
 > **Estado:** Base técnica completa. Falta integración end-to-end y herramientas de onboarding.
@@ -100,7 +100,7 @@ api/
 **Endpoint POST /generate/weekly:**
 ```json
 // Request
-{ "dry_run": false, "organization_id": "novolabs" }
+{ "dry_run": false, "organization_id": "marketingmaker" }
 // Response
 {
   "run_id": "uuid",
@@ -214,11 +214,11 @@ poc/agents/
 Trigger automático de ingesta y generación semanal.
 
 **Workflows a crear (exportar como JSON):**
-1. `novolabs_ingesta_drive.json` — detecta archivo nuevo en Drive → limpia transcripción → POST /ingest
-2. `novolabs_generacion_semanal.json` — cron domingo 23:00 → GET /health → POST /generate/weekly
+1. `marketingmaker_ingesta_drive.json` — detecta archivo nuevo en Drive → limpia transcripción → POST /ingest
+2. `marketingmaker_generacion_semanal.json` — cron domingo 23:00 → GET /health → POST /generate/weekly
 
 **Variables de entorno en n8n:**
-- `NOVOLABS_API_URL` = http://tu-servidor:8000
+- `MARKETINGMAKER_API_URL` = http://tu-servidor:8000
 - `OPENAI_API_KEY` (para preprocesamiento de transcripciones)
 - `GOOGLE_DRIVE_FOLDER_ID`
 
@@ -345,7 +345,7 @@ Lunes AM el cliente recibe un resumen del run del domingo.
 
 **Formato Telegram/email:**
 ```
-📊 Run semanal Novolabs — 15 mar 2026
+📊 Run semanal MarketingMaker — 15 mar 2026
 
 ✅ 48 piezas generadas
 👍 45 aprobadas por QA (93.7%)
@@ -435,8 +435,8 @@ Cada cliente tiene su propio workspace de Notion. El orquestador lee del workspa
 
 **Configuración por cliente en `.env` o tabla `organizations`:**
 ```
-ORG_NOVOLABS_NOTION_TOKEN=secret_...
-ORG_NOVOLABS_NOTION_REELS_DB=uuid
+ORG_MARKETINGMAKER_NOTION_TOKEN=secret_...
+ORG_MARKETINGMAKER_NOTION_REELS_DB=uuid
 ORG_CLIENTE2_NOTION_TOKEN=secret_...
 ORG_CLIENTE2_NOTION_REELS_DB=uuid
 ```

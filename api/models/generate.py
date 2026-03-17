@@ -23,7 +23,7 @@ class GenerateRequest(BaseModel):
         "json_schema_extra": {
             "example": {
                 "dry_run": False,
-                "organization_id": "novolabs"
+                "organization_id": "marketingmaker"
             }
         }
     }

@@ -1,6 +1,6 @@
-# Novolabs AI Engine
+# MarketingMaker AI Engine
 
-Sistema de generación automatizada de contenido semanal para Novolabs.
+Sistema de generación automatizada de contenido semanal para MarketingMaker.
 Ingesta transcripciones → genera reels, historias, emails y ads → publica en Notion.
 
 **Versión:** 3.0 (Fase 1 - Simplificada + Graph-in-a-Box)  
@@ -57,8 +57,14 @@ Lunes          Equipo revisa, aprueba y publica desde Notion
 ## Estructura del proyecto
 
 ```
-novolabs-ai-engine/
+marketingmaker-ai-engine/
 │
+├── .atl/                       # Agentes y Skill Registry
+│   └── skill-registry.md       # Mapa de capacidades de los agentes
+├── openspec/                   # Spec-Driven Development (SDD)
+│   ├── config.yaml             # Configuración y reglas de SDD
+│   ├── specs/                  # Especificaciones maestras (Source of Truth)
+│   └── changes/                # Trazabilidad de cambios activos y archivados
 ├── api/                        # FastAPI
 │   ├── main.py                 # Entry point, lifespan, routers
 │   ├── routes/
@@ -185,7 +191,7 @@ ENABLE_GRAPH=true docker compose --profile graph up -d
 El schema se aplica automáticamente al iniciar PostgreSQL si está en `sql/schema.sql`. Para aplicar manualmente:
 
 ```bash
-docker exec -i novolabs_postgres psql -U novolabs -d novolabs < sql/schema.sql
+docker exec -i marketingmaker_postgres psql -U marketingmaker -d marketingmaker < sql/schema.sql
 ```
 
 ---
@@ -331,14 +337,14 @@ El sistema valida cada pieza generada en dos capas:
 **Capa 2 - LLM (10% de piezas, muestreo aleatorio):**
 
 - Calidad de storytelling
-- Tono y voz coherentes con Novolabs
+- Tono y voz coherentes con MarketingMaker
 - Solo se ejecuta si la pieza ya pasó la Capa 1
 
 **Retry automático:** Si una pieza falla QA, se regenera una vez. Si vuelve a fallar, se marca como `QA_Failed` y continúa con la siguiente pieza (no bloquea el run).
 
 ---
 
-## Diversity Selector
+## Diversity Selector (MarketingMaker)
 
 El sistema evita repetir fuentes usando los campos `used_count` y `last_used_at` en la metadata del chunk:
 
@@ -415,6 +421,24 @@ Utilizar **Ollama** de forma local reduce el costo de LLM directamente a **$0**,
 - [ ] Trending topics desde Neo4j
 
 **Entregable:** Sistema semi-autónomo que sugiere tópicos
+
+---
+
+## Spec-Driven Development (SDD)
+
+El proyecto utiliza un flujo de desarrollo basado en especificaciones (SDD) para garantizar que cada cambio esté documentado, diseñado y verificado antes de su implementación final.
+
+### Flujo de trabajo SDD:
+1. **Exploración (`/sdd-explore`):** Investigación técnica y clarificación de requerimientos.
+2. **Propuesta (`/sdd-propose`):** Definición del alcance y enfoque del cambio.
+3. **Especificación (`/sdd-spec`):** Escritura de escenarios Given/When/Then.
+4. **Diseño (`/sdd-design`):** Decisiones de arquitectura y diagramas.
+5. **Tareas (`/sdd-tasks`):** Desglose en checklist de implementación.
+6. **Aplicación (`/sdd-apply`):** Ejecución del código siguiendo los artefactos anteriores.
+7. **Verificación (`/sdd-verify`):** Validación contra las especificaciones.
+8. **Archivo (`/sdd-archive`):** Sincronización de deltas a las specs maestras y auditoría histórica.
+
+Toda la documentación de este proceso reside en la carpeta `openspec/`.
 
 ---
 

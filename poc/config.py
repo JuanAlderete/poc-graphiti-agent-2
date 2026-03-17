@@ -66,9 +66,9 @@ class AppConfig(BaseSettings):
     # -------------------------------------------------------------------------
     # POSTGRESQL
     # -------------------------------------------------------------------------
-    POSTGRES_USER: str = Field(default="novolabs")
+    POSTGRES_USER: str = Field(default="marketingmaker")
     POSTGRES_PASSWORD: str = Field(default="")
-    POSTGRES_DB: str = Field(default="novolabs")
+    POSTGRES_DB: str = Field(default="marketingmaker")
     POSTGRES_HOST: str = Field(default="localhost")
     POSTGRES_PORT: int = Field(default=5432)
 

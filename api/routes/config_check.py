@@ -139,7 +139,7 @@ async def check_telegram_credentials(req: TelegramCheckRequest) -> dict:
                 f"https://api.telegram.org/bot{req.bot_token}/sendMessage",
                 json={
                     "chat_id": req.chat_id,
-                    "text": "✅ *Test de conexión exitoso* — Novolabs AI Engine",
+                    "text": "✅ *Test de conexión exitoso* — MarketingMaker AI Engine",
                     "parse_mode": "Markdown",
                 }
             )
