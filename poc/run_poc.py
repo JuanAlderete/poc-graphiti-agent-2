@@ -7,6 +7,7 @@ import time
 from agent.graph_utils import GraphClient
 from agent.tools import vector_search_with_diversity, hybrid_search
 from ingestion.embedder import get_embedder
+from ingestion.ingest import ingest_directory
 from poc.check_system import check_connections
 from poc.content_generator import get_content_generator
 from poc.prompts import email, historia, reel_cta, reel_lead_magnet

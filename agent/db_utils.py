@@ -211,14 +211,6 @@ class DatabasePool:
                 -- Índice GIN sobre relationships
                 CREATE INDEX IF NOT EXISTS idx_chunks_relationships
                     ON chunks USING GIN ((metadata->'relationships'));
-
-                -- Índice para filtrar por tipo de entidad
-                -- Útil para: "dame chunks con entidades de tipo Concepto Psicológico"
-                CREATE INDEX IF NOT EXISTS idx_chunks_entity_types
-                    ON chunks USING GIN (
-                        (SELECT jsonb_agg(e->>'type')
-                         FROM jsonb_array_elements(metadata->'entities') AS e)
-                    );
             """)
 
             # Función mark_chunk_used
@@ -332,7 +324,7 @@ async def insert_chunks(
                 (
                     UUID(doc_id),
                     chunk,
-                    "[" + ",".join(str(x) for x in embedding) + "]",
+                    embedding,
                     i,
                     token_counts[i],
                     json.dumps(metadata_list[i]),
