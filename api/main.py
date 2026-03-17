@@ -114,10 +114,12 @@ app.add_middleware(
 from api.routes.health import router as health_router
 from api.routes.ingest import router as ingest_router
 from api.routes.generate import router as generate_router
+from api.routes.config_check import router as config_check_router
 
 app.include_router(health_router)
 app.include_router(ingest_router)
 app.include_router(generate_router)
+app.include_router(config_check_router)
 
 
 # =============================================================================

@@ -41,6 +41,70 @@ lang = st.session_state["lang"]
 
 
 # ---------------------------------------------------------------------------
+# Helpers de configuración (.env)
+# ---------------------------------------------------------------------------
+
+ENV_FILE = ".env"
+
+def _read_env_file() -> dict:
+    """Lee el .env actual y retorna un dict con las variables."""
+    env_vars = {}
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    env_vars[key.strip()] = value.strip().strip('"').strip("'")
+    return env_vars
+
+def _write_env_file(env_vars: dict) -> None:
+    """
+    Escribe las variables en el .env.
+    Lee el archivo existente para preservar comentarios y estructura,
+    luego actualiza solo las variables que cambiaron.
+    """
+    # Leer contenido actual para preservar comentarios
+    existing_lines = []
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, "r", encoding="utf-8") as f:
+            existing_lines = f.readlines()
+
+    # Qué variables ya existen en el archivo
+    updated_keys = set()
+    new_lines = []
+    for line in existing_lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=")[0].strip()
+            if key in env_vars:
+                # Actualizar el valor
+                new_lines.append(f"{key}={env_vars[key]}\n")
+                updated_keys.add(key)
+            else:
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+
+    # Agregar variables nuevas que no estaban en el archivo
+    for key, value in env_vars.items():
+        if key not in updated_keys:
+            new_lines.append(f"{key}={value}\n")
+
+    with open(ENV_FILE, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+def _check_service(endpoint: str, payload: dict) -> dict:
+    """Llama a un endpoint de config check de la API y retorna el resultado."""
+    import requests
+    api_base = os.getenv("API_BASE_URL", "http://localhost:8000")
+    try:
+        resp = requests.post(f"{api_base}{endpoint}", json=payload, timeout=15)
+        return resp.json()
+    except Exception as e:
+        return {"status": "error", "message": str(e)[:200]}
+
+# ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
 
@@ -133,7 +197,7 @@ st.title(t("app.title", lang))
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_ingest, tab_kb, tab_search, tab_gen, tab_analytics, tab_projections, tab_neo4j = st.tabs([
+tab_ingest, tab_kb, tab_search, tab_gen, tab_analytics, tab_projections, tab_neo4j, tab_config = st.tabs([
     t("tab.ingestion", lang),
     t("tab.kb", lang),
     t("tab.search", lang),
@@ -141,6 +205,7 @@ tab_ingest, tab_kb, tab_search, tab_gen, tab_analytics, tab_projections, tab_neo
     t("tab.analytics", lang),
     t("tab.projections", lang),
     t("tab.neo4j", lang),
+    "⚙️ Configuración",
 ])
 
 
@@ -827,3 +892,405 @@ with tab_neo4j:
                     st.error(t("neo4j.cypher_error", lang, e=qe))
 
         _driver.close()
+
+# ── TAB CONFIGURACIÓN ────────────────────────────────────────────────────────
+with tab_config:
+    st.header("⚙️ Configuración del Sistema")
+    st.caption("Configurá todos los parámetros del sistema. Los cambios se guardan en el archivo `.env`.")
+
+    # Leer valores actuales del .env
+    current_env = _read_env_file()
+
+    # Función helper para mostrar el resultado de un chequeo
+    def _show_check_result(result: dict):
+        if result.get("status") == "ok":
+            st.success(f"✅ {result.get('message', 'Conexión exitosa')}")
+        else:
+            st.error(f"❌ {result.get('message', 'Error desconocido')}")
+
+    # ── Sección 1: Proveedor LLM ──────────────────────────────────────────
+    st.subheader("🤖 Proveedor LLM")
+    st.caption("El proveedor controla qué API se usa para generar contenido Y para crear embeddings.")
+
+    col_prov, col_info = st.columns([2, 3])
+    with col_prov:
+        provider_options = ["openai", "ollama", "gemini"]
+        current_provider = current_env.get("LLM_PROVIDER", "openai")
+        selected_provider = st.selectbox(
+            "Proveedor activo",
+            options=provider_options,
+            index=provider_options.index(current_provider) if current_provider in provider_options else 0,
+            key="cfg_provider",
+        )
+    with col_info:
+        provider_info = {
+            "openai": "🌐 **OpenAI API** — Mejor calidad. Requiere API key. Tiene costo por token.",
+            "ollama": "🏠 **Ollama local** — Sin costo. Datos no salen del servidor. Requiere GPU o paciencia.",
+            "gemini": "💎 **Google Gemini** — Alternativa económica. Requiere API key de Google.",
+        }
+        st.info(provider_info.get(selected_provider, ""))
+
+    st.divider()
+
+    # ── Sección 2: Credenciales según proveedor ───────────────────────────
+    st.subheader("🔑 API Keys y Credenciales")
+
+    cfg_to_save = {}
+
+    if selected_provider == "openai":
+        openai_key = st.text_input(
+            "OpenAI API Key",
+            value=current_env.get("OPENAI_API_KEY", ""),
+            type="password",
+            help="Empeza con 'sk-'. Obtenerla en https://platform.openai.com/api-keys",
+            key="cfg_openai_key",
+        )
+        openai_base_url = st.text_input(
+            "Base URL (dejar vacío para OpenAI oficial)",
+            value=current_env.get("OPENAI_BASE_URL", ""),
+            placeholder="https://api.openai.com/v1",
+            help="Solo cambiar si usás un proxy o Azure OpenAI",
+            key="cfg_openai_url",
+        )
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            default_model = st.text_input(
+                "Modelo principal",
+                value=current_env.get("DEFAULT_MODEL", "gpt-4.1-mini"),
+                placeholder="gpt-4.1-mini",
+                key="cfg_default_model",
+            )
+        with col_m2:
+            fallback_model = st.text_input(
+                "Modelo fallback (cuando budget > 90%)",
+                value=current_env.get("FALLBACK_MODEL", "gpt-4.1-mini"),
+                placeholder="gpt-4.1-mini",
+                key="cfg_fallback_model",
+            )
+
+        col_check_llm, _ = st.columns([1, 3])
+        with col_check_llm:
+            if st.button("🔍 Verificar conexión OpenAI", key="check_openai"):
+                with st.spinner("Verificando API key..."):
+                    r = _check_service("/config/check/llm", {
+                        "provider": "openai",
+                        "api_key": openai_key,
+                        "base_url": openai_base_url or None,
+                    })
+                _show_check_result(r)
+
+        cfg_to_save.update({
+            "LLM_PROVIDER": "openai",
+            "OPENAI_API_KEY": openai_key,
+            "OPENAI_BASE_URL": openai_base_url,
+            "DEFAULT_MODEL": default_model,
+            "FALLBACK_MODEL": fallback_model,
+        })
+
+    elif selected_provider == "ollama":
+        ollama_url = st.text_input(
+            "URL de Ollama",
+            value=current_env.get("OPENAI_BASE_URL", "http://localhost:11434/v1"),
+            placeholder="http://localhost:11434/v1",
+            help="URL base de Ollama. En Docker: http://ollama:11434/v1",
+            key="cfg_ollama_url",
+        )
+        col_om1, col_om2 = st.columns(2)
+        with col_om1:
+            ollama_model = st.text_input(
+                "Modelo de generación",
+                value=current_env.get("DEFAULT_MODEL", "llama3.1:8b"),
+                placeholder="llama3.1:8b",
+                help="Debe estar descargado: ollama pull llama3.1:8b",
+                key="cfg_ollama_model",
+            )
+        with col_om2:
+            ollama_embed = st.text_input(
+                "Modelo de embeddings",
+                value=current_env.get("EMBEDDING_MODEL", "nomic-embed-text"),
+                placeholder="nomic-embed-text",
+                help="Debe estar descargado: ollama pull nomic-embed-text",
+                key="cfg_ollama_embed",
+            )
+        st.caption("⚠️ Si cambiás el modelo de embeddings, ejecutá `bash scripts/reset_db.sh` para reiniciar la DB.")
+
+        col_check_ollama, _ = st.columns([1, 3])
+        with col_check_ollama:
+            if st.button("🔍 Verificar conexión Ollama", key="check_ollama"):
+                with st.spinner("Verificando Ollama..."):
+                    r = _check_service("/config/check/llm", {
+                        "provider": "ollama",
+                        "base_url": ollama_url,
+                    })
+                _show_check_result(r)
+
+        cfg_to_save.update({
+            "LLM_PROVIDER": "ollama",
+            "OPENAI_API_KEY": "ollama",
+            "OPENAI_BASE_URL": ollama_url,
+            "DEFAULT_MODEL": ollama_model,
+            "EMBEDDING_MODEL": ollama_embed,
+        })
+
+    elif selected_provider == "gemini":
+        gemini_key = st.text_input(
+            "Gemini API Key",
+            value=current_env.get("GEMINI_API_KEY", ""),
+            type="password",
+            help="Obtenerla en https://aistudio.google.com/app/apikey",
+            key="cfg_gemini_key",
+        )
+
+        col_check_gemini, _ = st.columns([1, 3])
+        with col_check_gemini:
+            if st.button("🔍 Verificar conexión Gemini", key="check_gemini"):
+                with st.spinner("Verificando Gemini..."):
+                    r = _check_service("/config/check/llm", {
+                        "provider": "gemini",
+                        "gemini_api_key": gemini_key,
+                    })
+                _show_check_result(r)
+
+        cfg_to_save.update({
+            "LLM_PROVIDER": "gemini",
+            "GEMINI_API_KEY": gemini_key,
+        })
+
+    st.divider()
+
+    # ── Sección 3: PostgreSQL ─────────────────────────────────────────────
+    st.subheader("🐘 Base de Datos (PostgreSQL)")
+
+    col_pg1, col_pg2 = st.columns(2)
+    with col_pg1:
+        pg_host = st.text_input("Host", value=current_env.get("POSTGRES_HOST", "localhost"), key="cfg_pg_host")
+        pg_db   = st.text_input("Database", value=current_env.get("POSTGRES_DB", "novolabs"), key="cfg_pg_db")
+        pg_user = st.text_input("Usuario", value=current_env.get("POSTGRES_USER", "novolabs"), key="cfg_pg_user")
+    with col_pg2:
+        pg_port = st.number_input("Puerto", value=int(current_env.get("POSTGRES_PORT", "5432")), min_value=1, max_value=65535, key="cfg_pg_port")
+        pg_pass = st.text_input("Password", value=current_env.get("POSTGRES_PASSWORD", ""), type="password", key="cfg_pg_pass")
+
+    col_check_pg, _ = st.columns([1, 3])
+    with col_check_pg:
+        if st.button("🔍 Verificar conexión Postgres", key="check_pg"):
+            with st.spinner("Verificando Postgres..."):
+                r = _check_service("/config/check/postgres", {
+                    "host": pg_host, "port": pg_port,
+                    "database": pg_db, "user": pg_user, "password": pg_pass,
+                })
+            _show_check_result(r)
+
+    cfg_to_save.update({
+        "POSTGRES_HOST": pg_host,
+        "POSTGRES_PORT": str(pg_port),
+        "POSTGRES_DB": pg_db,
+        "POSTGRES_USER": pg_user,
+        "POSTGRES_PASSWORD": pg_pass,
+    })
+
+    st.divider()
+
+    # ── Sección 4: Notion ─────────────────────────────────────────────────
+    st.subheader("📋 Notion")
+    st.caption("Configurá el token y los IDs de cada base de datos. Los IDs están en la URL de cada DB en Notion.")
+
+    notion_token = st.text_input(
+        "Token de integración Notion",
+        value=current_env.get("NOTION_TOKEN", ""),
+        type="password",
+        help="Obtenerlo en https://www.notion.so/my-integrations",
+        key="cfg_notion_token",
+    )
+
+    col_check_notion, _ = st.columns([1, 3])
+    with col_check_notion:
+        if st.button("🔍 Verificar token Notion", key="check_notion"):
+            with st.spinner("Verificando Notion..."):
+                r = _check_service("/config/check/notion", {"token": notion_token})
+            _show_check_result(r)
+
+    st.caption("**IDs de bases de datos** — Copiar de la URL de cada DB en Notion (el UUID al final)")
+
+    notion_dbs = {}
+    db_labels = {
+        "NOTION_RULES_DB":    "Weekly Rules DB",
+        "NOTION_REELS_DB":    "Reels DB (output)",
+        "NOTION_HISTORIA_DB": "Historias DB (output)",
+        "NOTION_EMAIL_DB":    "Emails DB (output)",
+        "NOTION_ADS_DB":      "Ads DB (output)",
+        "NOTION_RUNS_DB":     "Weekly Runs DB (log)",
+    }
+
+    cols_notion = st.columns(2)
+    for idx, (env_key, label) in enumerate(db_labels.items()):
+        with cols_notion[idx % 2]:
+            db_value = st.text_input(
+                label,
+                value=current_env.get(env_key, ""),
+                placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+                key=f"cfg_{env_key}",
+            )
+            notion_dbs[env_key] = db_value
+
+            # Botón individual de verificación para cada DB
+            if db_value and notion_token:
+                if st.button(f"Verificar acceso", key=f"check_db_{env_key}"):
+                    with st.spinner(f"Verificando {label}..."):
+                        r = _check_service("/config/check/notion", {
+                            "token": notion_token,
+                            "database_id": db_value,
+                        })
+                    _show_check_result(r)
+
+    cfg_to_save["NOTION_TOKEN"] = notion_token
+    cfg_to_save.update(notion_dbs)
+
+    st.divider()
+
+    # ── Sección 5: Telegram ───────────────────────────────────────────────
+    st.subheader("💬 Telegram (notificaciones)")
+    st.caption("Opcional. Si no configurás esto, el sistema funciona pero no enviará alertas.")
+
+    col_tg1, col_tg2 = st.columns(2)
+    with col_tg1:
+        tg_token = st.text_input(
+            "Bot Token",
+            value=current_env.get("TELEGRAM_BOT_TOKEN", ""),
+            type="password",
+            help="Obtenerlo hablando con @BotFather en Telegram",
+            key="cfg_tg_token",
+        )
+    with col_tg2:
+        tg_chat = st.text_input(
+            "Chat ID",
+            value=current_env.get("TELEGRAM_CHAT_ID", ""),
+            placeholder="-100xxxxxxxxxx",
+            help="ID del grupo o canal. Usar @userinfobot para obtenerlo.",
+            key="cfg_tg_chat",
+        )
+
+    col_check_tg, _ = st.columns([1, 3])
+    with col_check_tg:
+        if st.button("🔍 Verificar y enviar mensaje de prueba", key="check_tg"):
+            if not tg_token or not tg_chat:
+                st.warning("Completá tanto el Bot Token como el Chat ID")
+            else:
+                with st.spinner("Enviando mensaje de prueba..."):
+                    r = _check_service("/config/check/telegram", {
+                        "bot_token": tg_token,
+                        "chat_id": tg_chat,
+                    })
+                _show_check_result(r)
+
+    cfg_to_save.update({
+        "TELEGRAM_BOT_TOKEN": tg_token,
+        "TELEGRAM_CHAT_ID": tg_chat,
+    })
+
+    st.divider()
+
+    # ── Sección 6: Budget Guard ───────────────────────────────────────────
+    st.subheader("💰 Control de Presupuesto")
+    st.caption("Solo aplica con OpenAI o Gemini. En Ollama el costo es $0 y se ignora automáticamente.")
+
+    col_bg1, col_bg2, col_bg3 = st.columns(3)
+    with col_bg1:
+        budget_usd = st.number_input(
+            "Presupuesto mensual (USD)",
+            value=float(current_env.get("MONTHLY_BUDGET_USD", "50")),
+            min_value=0.0, step=5.0, format="%.2f",
+            help="0 = sin límite. Recomendado: $50 para empezar.",
+            key="cfg_budget",
+        )
+    with col_bg2:
+        alert_1 = st.slider(
+            "Alerta 1 (% usado)",
+            min_value=50, max_value=89, value=int(float(current_env.get("BUDGET_ALERT_THRESHOLD_1", "0.70")) * 100),
+            key="cfg_alert1",
+        )
+    with col_bg3:
+        alert_2 = st.slider(
+            "Fallback model activar (% usado)",
+            min_value=alert_1 + 1, max_value=99,
+            value=int(float(current_env.get("BUDGET_ALERT_THRESHOLD_2", "0.90")) * 100),
+            key="cfg_alert2",
+        )
+
+    cfg_to_save.update({
+        "MONTHLY_BUDGET_USD": str(budget_usd),
+        "BUDGET_ALERT_THRESHOLD_1": str(alert_1 / 100),
+        "BUDGET_ALERT_THRESHOLD_2": str(alert_2 / 100),
+    })
+
+    st.divider()
+
+    # ── Sección 7: Opciones avanzadas ─────────────────────────────────────
+    st.subheader("🔧 Opciones Avanzadas")
+
+    col_adv1, col_adv2 = st.columns(2)
+    with col_adv1:
+        enable_entities = st.toggle(
+            "Extracción de entidades en ingesta (LightRAG)",
+            value=current_env.get("ENABLE_ENTITY_EXTRACTION", "true").lower() == "true",
+            help="Extrae entidades y relaciones de cada chunk usando LLM. ~$0.001/chunk con OpenAI. Gratis con Ollama.",
+            key="cfg_entities",
+        )
+        enable_graph = st.toggle(
+            "Activar Neo4j (Fase 2+)",
+            value=current_env.get("ENABLE_GRAPH", "false").lower() == "true",
+            help="Activa el grafo de conocimiento. Solo necesario cuando tenés +10.000 documentos.",
+            key="cfg_graph",
+        )
+    with col_adv2:
+        max_concurrent = st.number_input(
+            "Generaciones concurrentes máximas",
+            value=int(current_env.get("MAX_CONCURRENT_GENERATIONS", "5")),
+            min_value=1, max_value=20,
+            help="Más concurrencia = más rápido pero más riesgo de rate limits.",
+            key="cfg_concurrent",
+        )
+        log_level = st.selectbox(
+            "Nivel de logs",
+            options=["DEBUG", "INFO", "WARNING", "ERROR"],
+            index=["DEBUG", "INFO", "WARNING", "ERROR"].index(
+                current_env.get("LOG_LEVEL", "INFO")
+            ),
+            key="cfg_log_level",
+        )
+
+    cfg_to_save.update({
+        "ENABLE_ENTITY_EXTRACTION": "true" if enable_entities else "false",
+        "ENABLE_GRAPH": "true" if enable_graph else "false",
+        "MAX_CONCURRENT_GENERATIONS": str(max_concurrent),
+        "LOG_LEVEL": log_level,
+    })
+
+    st.divider()
+
+    # ── Botón de guardado ─────────────────────────────────────────────────
+    st.subheader("💾 Guardar configuración")
+    
+    col_save1, col_save2 = st.columns([1, 3])
+    with col_save1:
+        if st.button("💾 Guardar en .env", type="primary", key="cfg_save"):
+            try:
+                # Filtrar valores vacíos que no queremos sobreescribir
+                clean_cfg = {k: v for k, v in cfg_to_save.items() if v is not None}
+                _write_env_file(clean_cfg)
+                st.success("✅ Configuración guardada en `.env`. Reiniciá el servidor para aplicar los cambios.")
+                st.info("💡 Para aplicar sin reiniciar, recargá esta página. Algunos cambios (como el proveedor LLM) requieren reiniciar el servidor FastAPI y Streamlit.")
+            except Exception as e:
+                st.error(f"❌ Error guardando: {e}")
+    with col_save2:
+        st.caption(
+            "Los cambios en `.env` no se aplican automáticamente al proceso en ejecución. "
+            "Necesitás reiniciar `uvicorn api.main:app` y `streamlit run dashboard/app.py` para que tomen efecto."
+        )
+    
+    # Mostrar el .env actual (sin passwords)
+    with st.expander("👁️ Ver configuración actual (.env sanitizado)"):
+        env_display = {
+            k: ("***" if any(w in k.lower() for w in ["key", "password", "token", "secret"]) else v)
+            for k, v in current_env.items()
+        }
+        st.json(env_display)

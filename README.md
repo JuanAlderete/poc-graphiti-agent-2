@@ -64,23 +64,25 @@ novolabs-ai-engine/
 │   ├── routes/
 │   │   ├── health.py           # GET /health
 │   │   ├── ingest.py           # POST /ingest
-│   │   └── generate.py         # POST /generate/weekly
+│   │   ├── generate.py         # POST /generate/weekly (Via MainOrchestrator)
+│   │   └── config_check.py     # POST /config/check/* (Tests de credenciales interactivo)
 │   └── models/
 │       ├── ingest.py           # IngestRequest, IngestResponse
 │       └── generate.py         # GenerateRequest, GenerateResponse
 │
-├── agents/                     # Subagentes de generación
-│   ├── base_agent.py           # Clase base con QA Gate programático
+├── poc/agents/                 # Subagentes de generación
+│   ├── base_agent.py           # Clase base abstracta con esquemas JSON de salida
 │   ├── reel_cta_agent.py       # Genera Reels CTA
-│   ├── reel_lm_agent.py        # Genera Reels Lead Magnet
+│   ├── reel_lead_magnet_agent.py # Genera Reels Lead Magnet
 │   ├── historia_agent.py       # Genera Historias
 │   ├── email_agent.py          # Genera Emails
-│   └── ads_agent.py            # Genera Anuncios (Fase 1)
+│   ├── ads_agent.py            # Genera Anuncios (Fase 1)
+│   └── registry.py             # Mapeo de Subagentes a formatos disponibles
 │
 ├── orchestrator/               # Orquestador del flujo semanal
 │   ├── base.py                 # Clase abstracta JobType
-│   ├── main.py                 # Main Orchestrator
-│   └── weekly_job.py           # WeeklyContentJob
+│   ├── main.py                 # Main Orchestrator (Job Entry Point)
+│   └── weekly_job.py           # WeeklyContentJob (Lógica de Generación con fallback)
 │
 ├── ingestion/                  # Pipeline de ingesta
 │   ├── ingest.py               # Coordinador de ingesta
@@ -88,14 +90,17 @@ novolabs-ai-engine/
 │   └── sources/                # Adaptadores de fuentes
 │
 ├── storage/                    # Clientes de storage
-│   ├── notion_client.py        # Notion API (leer SOPs, publicar piezas)
+│   ├── notion_client.py        # Notion API (AsyncClient y Rate-Limiter centralizado)
 │   └── db_pool.py              # Connection pool Postgres
 │
-├── agent/                      # Utilidades de bajo nivel (del POC, refactorizar gradualmente)
+├── agent/                      # Utilidades de Graph y RAG Core
 │   ├── config.py               # Settings centralizados (ENABLE_GRAPH, etc.)
 │   ├── custom_openai_client.py # Cliente OpenAI con rate limit handling
 │   ├── db_utils.py             # Helpers de base de datos
-│   └── tools.py                # Búsqueda vectorial con diversity
+│   └── tools.py                # Búsqueda vectorial con diversity y Hybrid Search
+│
+├── config/                     # Configuraciones estáticas y mapeos
+│   └── notion_schema.py        # Mapeos de bases de datos de Notion (desacoplado)
 │
 ├── monitoring/                 # Observabilidad
 │   └── telegram.py             # Notificaciones Telegram
@@ -255,6 +260,20 @@ curl -X POST http://localhost:8000/generate/weekly \
 }
 ```
 
+## Configuración desde el Dashboard (Streamlit)
+
+La versión v3.0 actual introduce una Pestaña de **Configuración Interactiva** accesible desde el navegador web mediante Streamlit. Esta interfaz permite gestionar las principales credenciales e integraciones sin necesidad de conocimientos de programación, alterando dinámicamente el archivo interno `.env`.
+
+### Opciones configurables desde el Dashboard:
+1. **Proveedor LLM y Credenciales:** Permite elegir entre OpenAI (con su respectiva base_URL para proxies), Ollama local o Google Gemini. Proporciona además campos seguros para ingresar y ocultar las API Keys y verificar su validez conectándose directamente con los servidores de estos proveedores.
+2. **Base de Datos (PostgreSQL):** Modifica los accesos (Host, Usuario, Database, Password y Port) verificándolos programáticamente contra una sesión instanciada.
+3. **Roles y Flujos con Notion:** Ajusta los identificadores (IDs UUID) de las Bases de Datos generadas en Notion (Weekly Rules, Historias, Reels, Emails, etc.) y re-evalúa el acceso del token bot a cada una en tiempo real.
+4. **Notificaciones de Telegram:** Conexión segura al token y chat IDs para testear los envíos vía Telegram para los resultados logísticos del Orquestador.
+5. **Control de Presupuesto:** Permite asignar la cuota en dólares máxima del mes, así como porcentajes de alarma al 70% o uso de modelos Fallbacks al 90%.
+6. **Opciones Avanzadas:** Activación por switch de extracción LLM de Entidades, control del grafo Neo4j (Fase 2) y capacidad de generaciones asíncronas concurrentes.
+
+_**Nota:** Toda modificación efectuada desde el panel web debe ir acompañada de un reinicio sobre los procesos del servidor `FastAPI` y de `Streamlit` para ser impactadas en los componentes lógicos del núcleo._
+
 ---
 
 ## Metadata de chunks
@@ -361,12 +380,13 @@ Utilizar **Ollama** de forma local reduce el costo de LLM directamente a **$0**,
 ### Fase 1 (Semanas 1–6): MVP funcional ← _Estamos aquí_
 
 - [x] Budget Guard con alertas y fallback automático
-- [ ] FastAPI: `/health`, `/ingest`, `/generate/weekly`
+- [x] FastAPI: `/health`, `/ingest`, `/generate/weekly`, Endpoints `/config/check/*`
+- [x] Panel de Configuración Interactivo en Streamlit (Gestión nativa de `.env` y Healthchecks de APIs)
+- [x] Orquestador + WeeklyContentJob (Flujo conectivo base)
+- [x] Subagentes con output JSON estructurado + QA Gate programático
 - [ ] Notion Integration: leer Weekly Rules y SOPs, publicar piezas
-- [ ] Orquestador + WeeklyContentJob
-- [ ] Subagentes con output JSON estructurado + QA Gate programático
 - [ ] Telegram Bot: alertas de ingesta y resultados
-- [ ] n8n: webhook Google Drive + cron dominical
+- [ ] n8n: webhook Google Drive + cron dominical [MANUAL]
 - [ ] TaxonomyManager: clasificación en ingesta sin LLM
 
 **Entregable:** 50–70 piezas/semana automáticas en Notion

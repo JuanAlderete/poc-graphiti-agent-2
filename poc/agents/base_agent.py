@@ -19,7 +19,7 @@ from typing import Optional
 
 from agent.custom_openai_client import CustomOpenAIClient
 from agent.config import settings
-from poc.budget_guard import BudgetGuard
+from poc.budget_guard import check_budget_and_warn, get_active_model, record_cost
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +57,9 @@ class ContentPiece:
 @dataclass
 class AgentInput:
     """Input estándar para todos los agentes."""
-    topic:        str              # Tópico a generar
-    chunk:        Optional[dict] = None    # SearchResult serializado
-    sop:          Optional[str] = None    # SOP desde Notion (opcional en Fase 1)
+    topic:        str                       # Tópico a generar
+    chunk:        Optional[dict] = None     # SearchResult serializado (ahora estrictamente mapam de dict)
+    sop:          Optional[str] = None      # SOP desde Notion (opcional en Fase 1)
     extra:        dict = field(default_factory=dict)
 
 
@@ -84,7 +84,6 @@ class BaseAgent(ABC):
 
     def __init__(self):
         self.client = CustomOpenAIClient()
-        self.budget = BudgetGuard()
 
     # --------------------------------------------------------------------------
     # MÉTODO PRINCIPAL
@@ -105,7 +104,7 @@ class BaseAgent(ABC):
         8. Si pasa QA: opcionalmente valida con LLM (10% de probabilidad)
         """
         # Verificar presupuesto antes de generar
-        if not await self.budget.can_generate():
+        if check_budget_and_warn() == "critical":
             logger.warning("generate: budget agotado, no se puede generar")
             return ContentPiece(
                 content_type=self.content_type,
@@ -115,7 +114,7 @@ class BaseAgent(ABC):
                 chunk_id=agent_input.chunk.get("chunk_id") if agent_input.chunk else None,
             )
 
-        model = await self.budget.get_current_model()
+        model = get_active_model()
         
         for attempt in range(2):  # máximo 2 intentos (original + 1 retry)
             try:
@@ -128,7 +127,7 @@ class BaseAgent(ABC):
                 )
 
                 # Registrar costo
-                cost = self.budget.track_usage(model, usage.prompt_tokens, usage.completion_tokens)
+                cost = record_cost(model, usage.prompt_tokens, usage.completion_tokens)
                 
                 # Parsear respuesta
                 data = self._parse_response(response)
@@ -197,7 +196,7 @@ class BaseAgent(ABC):
 
     @abstractmethod
     def _parse_response(self, response: str) -> dict:
-        """Parsea la respuesta JSON del LLM a un dict estructurado."""
+        """Parsea la respuesta JSON del LLM a un dict estructurado mapeado a properties de Notion."""
         ...
 
     @abstractmethod
@@ -300,7 +299,7 @@ Contenido a revisar:
                 temperature=0.0,
                 response_format={"type": "json_object"},
             )
-            await self.budget.track_usage(model, usage.prompt_tokens, usage.completion_tokens)
+            record_cost(model, usage.prompt_tokens, usage.completion_tokens)
             
             import json as json_lib2
             result = json_lib2.loads(response)

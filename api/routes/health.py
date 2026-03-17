@@ -33,6 +33,7 @@ async def health_check() -> dict:
         "status": "ok",
         "postgres": "unknown",
         "neo4j": "disabled",
+        "llm": "unknown",
         "llm_provider": config.LLM_PROVIDER,
         "embedding_model": config.EMBEDDING_MODEL,
         "embedding_dims": config.EMBEDDING_DIMS,
@@ -63,6 +64,38 @@ async def health_check() -> dict:
             logger.error("Health check: Neo4j falló: %s", e)
             result["neo4j"] = f"error: {str(e)[:100]}"
             result["status"] = "degraded"
+
+    # ── LLM ───────────────────────────────────────────────────────────────────
+    try:
+        if config.LLM_PROVIDER.lower() == "ollama":
+            # Verificar que Ollama responde en la URL configurada
+            base_url = config.OPENAI_BASE_URL or "http://localhost:11434"
+            import httpx
+            async with httpx.AsyncClient(timeout=5.0) as http_client:
+                resp = await http_client.get(f"{base_url.rstrip('/v1').rstrip('/')}/api/tags")
+                if resp.status_code == 200:
+                    result["llm"] = "ok"
+                else:
+                    result["llm"] = f"error: Ollama respondió {resp.status_code}"
+                    result["status"] = "degraded"
+        elif config.LLM_PROVIDER.lower() == "openai":
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+            # Llamada mínima y barata: listar modelos (no genera tokens)
+            await client.models.list()
+            result["llm"] = "ok"
+        elif config.LLM_PROVIDER.lower() == "gemini":
+            import google.generativeai as genai
+            genai.configure(api_key=config.GEMINI_API_KEY)
+            # Verificar que la key permite listar modelos
+            models = genai.list_models()
+            list(models)  # forzar evaluación del generador
+            result["llm"] = "ok"
+        else:
+            result["llm"] = f"unknown provider: {config.LLM_PROVIDER}"
+    except Exception as e:
+        result["llm"] = f"error: {str(e)[:120]}"
+        result["status"] = "degraded"
 
     # ── Budget ────────────────────────────────────────────────────────────────
     try:

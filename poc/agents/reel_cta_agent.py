@@ -1,58 +1,68 @@
-"""Agente para Reels con CTA (Call to Action)."""
-from poc.agents.base_agent import ContentAgent, AgentInput
+"""
+poc/agents/reel_cta_agent.py
+----------------------------
+Agente específico para generación de Reels CTA.
+Mapea estrictamente hacia el esquema de Notion.
+"""
+from typing import Optional, List
+from poc.agents.base_agent import BaseAgent, AgentInput
 
-
-class ReelCTAAgent(ContentAgent):
-    format_name = "reel_cta"
-    default_sop = (
-        "El reel debe enganchar en los primeros 3 segundos con una pregunta o afirmación fuerte. "
-        "Usar lenguaje conversacional, directo. El CTA debe ser claro y único. "
-        "Máximo 45 segundos de guion (aprox 120 palabras). "
-        "No usar jerga técnica. Hablar en segunda persona (tú/vos)."
-    )
-
-    def _get_system_prompt(self) -> str:
-        return (
-            "Eres un guionista experto en Reels y TikToks virales para el mercado hispanohablante. "
-            "SIEMPRE respondes ÚNICAMENTE con un objeto JSON válido, sin texto adicional, sin markdown."
+class ReelCTAAgent(BaseAgent):
+    content_type = "reel_cta"
+    
+    def _build_prompt(self, agent_input: AgentInput) -> str:
+        # SOP es pasado en agent_input.sop. Si no existe un fallback
+        sop = agent_input.sop or (
+            "El reel debe enganchar en los primeros 3 segundos con una pregunta o afirmación fuerte. "
+            "Usar lenguaje conversacional, directo. El CTA debe ser claro y único. "
+            "Máximo 45 segundos de guion (aprox 120 palabras). "
+            "Hablar en segunda persona (tú/vos)."
         )
+        cta_req = agent_input.extra.get("cta", "Call to Action Específico desde Topic")
+        
+        # El context debe extraerse del chunk dictionary de manera tolerante a faltas
+        context_text = agent_input.chunk.get("content", "") if agent_input.chunk else "Sin contexto extraído."
 
-    def _build_prompt(self, agent_input: AgentInput, sop: str) -> str:
-        cta = agent_input.extra.get("cta", "Sígueme para más contenido")
-        return f"""Crea un guion completo para un Reel de Instagram sobre el siguiente tema.
+        return f"""Crea un guion completo para un Reel de Instagram.
 
-TEMA: {agent_input.topic}
+TEMA PRINCIPAL: {agent_input.topic}
+CONTEXTO EXTRAÍDO: {context_text}
+CTA ESPERADO: {cta_req}
 
-CONTEXTO EXTRAÍDO DE DOCUMENTOS REALES:
-{agent_input.context}
-
-CTA REQUERIDO: {cta}
-
-INSTRUCCIONES DE ESTILO (SOP):
+INSTRUCCIONES DE FORMATO (SOP):
 {sop}
 
-Responde ÚNICAMENTE con este JSON (sin texto extra, sin ```json```):
+Responde ÚNICAMENTE con JSON, con la siguiente estructura exacta:
 {{
-  "hook": "Los primeros 3 segundos que enganchen al espectador (máx 15 palabras)",
-  "problema": "El pain point que el reel aborda (1-2 oraciones)",
-  "desarrollo": "Cuerpo del guion con la solución o insight principal (3-5 oraciones)",
-  "cta": "Llamado a la acción final exacto",
-  "sugerencias_grabacion": "Tips de producción: toma, luz, velocidad de cortes",
-  "copy_descripcion": "Texto para poner en la descripción del reel (máx 150 chars)"
-}}"""
+  "hook": "Los primeros 3 segundos (máx 15 palabras)",
+  "script": "Cuerpo completo del guion con solución o insight",
+  "cta": "El llamado a la acción exacto requerido",
+  "sugerencias_grabacion": "Tips de Producción",
+  "copy": "Texto para poner en la descripción del Reel"
+}}
+"""
 
-    def _parse_output(self, raw_text: str) -> dict:
-        data = self._safe_json_parse(raw_text)
-        # Normalizar claves esperadas
-        for key in ["hook", "problema", "desarrollo", "cta", "sugerencias_grabacion", "copy_descripcion"]:
-            data.setdefault(key, "")
-        return data
+    def _parse_response(self, response: str) -> dict:
+        data = self.client.parse_json_response(response)
+        if not data:
+            return {}
+            
+        # Homologar propiedades con el schema notion_schema "reel_cta"
+        return {
+            "hook": data.get("hook", ""),
+            "script": data.get("script", ""),
+            "cta": data.get("cta", ""),
+            "sugerencias_grabacion": data.get("sugerencias_grabacion", ""),
+            "copy": data.get("copy", "")
+        }
 
-    def _validate(self, data: dict, agent_input: AgentInput) -> tuple[bool, str]:
+    def _extra_validations(self, data: dict, agent_input: AgentInput) -> List[str]:
+        errors = []
         if not data.get("hook"):
-            return False, "Missing hook"
-        if not data.get("cta"):
-            return False, "Missing CTA"
+            errors.append("Falta propiedad 'hook'")
+        if not data.get("script"):
+            errors.append("Falta propiedad 'script' (Guion vacío)")
         if len(data.get("hook", "")) > 200:
-            return False, "Hook too long"
-        return True, ""
+            errors.append("Hook supera los 200 caracteres")
+            
+        return errors

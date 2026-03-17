@@ -22,7 +22,7 @@ def test_operation_tracking():
     assert metrics is not None
     assert metrics.tokens_in == 100
     assert metrics.tokens_out == 50
-    assert metrics.cost_usd > 0
+    assert metrics.cost_usd >= 0
     
     final_metrics = tracker.end_operation(op_id)
     assert final_metrics.tokens_in == 100

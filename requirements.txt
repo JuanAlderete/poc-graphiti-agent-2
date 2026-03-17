@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # NOVOLABS AI ENGINE - Requirements
 # Soporta: OpenAI, Ollama (compatible OpenAI), Gemini
 # =============================================================================
@@ -15,6 +15,9 @@ google-generativeai
 # --- Knowledge graph (opcional, solo si ENABLE_GRAPH=true) ---
 graphiti-core==0.12.4
 neo4j==5.28.1
+
+# --- Notion ---
+notion-client>=2.2.1
 
 # --- Ingesta / ML ---
 tiktoken
@@ -43,3 +46,4 @@ pytest-asyncio==1.0.0
 # --- Misc ---
 tenacity
 PyYAML
+requests>=2.31.0

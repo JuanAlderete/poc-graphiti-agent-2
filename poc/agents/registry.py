@@ -4,9 +4,9 @@ from poc.agents.historia_agent import HistoriaAgent
 from poc.agents.email_agent import EmailAgent
 from poc.agents.reel_lead_magnet_agent import ReelLeadMagnetAgent
 from poc.agents.ads_agent import AdsAgent
-from poc.agents.base_agent import ContentAgent
+from poc.agents.base_agent import BaseAgent
 
-_REGISTRY: dict[str, ContentAgent] = {
+_REGISTRY: dict[str, BaseAgent] = {
     "reel_cta": ReelCTAAgent(),
     "historia": HistoriaAgent(),
     "email": EmailAgent(),
@@ -15,7 +15,7 @@ _REGISTRY: dict[str, ContentAgent] = {
 }
 
 
-def get_agent(formato: str) -> ContentAgent:
+def get_agent(formato: str) -> BaseAgent:
     """
     Retorna el agente para el formato solicitado.
     Lanza ValueError si el formato no existe.
