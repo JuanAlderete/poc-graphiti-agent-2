@@ -113,6 +113,7 @@ services:
     ports:
       - "${DASHBOARD_PORT:-8502}:8501"
     environment:
+      API_BASE_URL:      http://marketingmaker_api:8000
       LLM_PROVIDER:      ${LLM_PROVIDER:-openai}
       OPENAI_API_KEY:    ${OPENAI_API_KEY:-ollama}
       OPENAI_BASE_URL:   ${OPENAI_BASE_URL:-}
