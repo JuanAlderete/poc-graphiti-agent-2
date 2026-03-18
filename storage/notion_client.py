@@ -142,16 +142,36 @@ class NotionClient:
             logger.error(f"publish_piece: variable {db_env_var} no configurada")
             return None
 
+        # Auto-inyectar 'title' desde el campo semantico correspondiente al formato
+        if "title" not in piece_data:
+            if content_type in ["reel_cta", "reel_lead_magnet"]:
+                piece_data["title"] = piece_data.pop("hook", "Sin Hook")
+            elif content_type == "email":
+                piece_data["title"] = piece_data.pop("asunto", "Sin Asunto")
+            elif content_type == "ads":
+                # headlines puede ser lista o string; usamos el primer elemento si es lista
+                headlines = piece_data.pop("headlines", "Sin Headline")
+                if isinstance(headlines, list):
+                    headlines = headlines[0] if headlines else "Sin Headline"
+                piece_data["title"] = str(headlines)[:2000]
+            elif content_type == "historia":
+                piece_data["title"] = piece_data.get("tipo", "Historia")
+
         props_map = schema_entry["properties"]
+        type_overrides = schema_entry.get("type_overrides", {})
         notion_properties = {}
 
         # Mapeamos lo que llega de piece_data a las propiedades de notion
-        # Asume que un piece_data puede contener: title, hook, script, cta, estado, rating, chunk_id, etc.
         for internal_key, value in piece_data.items():
             if internal_key in props_map and value is not None:
                 notion_prop_name = props_map[internal_key]
-                # Determinamos el type dependiendo de internal_key por convención o esquema
-                notion_properties[notion_prop_name] = _build_notion_property(internal_key, value)
+                # Usar override de tipo si existe para este formato
+                override_type = type_overrides.get(internal_key)
+                if override_type == "rich_text":
+                    v = str(value)[:2000]
+                    notion_properties[notion_prop_name] = {"rich_text": [{"text": {"content": v}}]}
+                else:
+                    notion_properties[notion_prop_name] = _build_notion_property(internal_key, value)
 
         try:
             resp = await self._request(
@@ -182,12 +202,17 @@ class NotionClient:
         schema = schema_entry["properties"]
         
         notion_properties = {
-            schema["title"]: _build_notion_property("title", run_id),
-            schema["piezas"]: _build_notion_property("number", results_summary.get("total", 0)),
-            schema["aprobadas_qa"]: _build_notion_property("number", results_summary.get("passed", 0)),
-            schema["fallidas_qa"]: _build_notion_property("number", results_summary.get("failed", 0)),
-            schema["costo_usd"]: _build_notion_property("number", results_summary.get("cost_usd", 0.0)),
+            schema["title"]:        _build_notion_property("title",    run_id),
+            schema["piezas"]:       _build_notion_property("cantidad", results_summary.get("total", 0)),
+            schema["aprobadas_qa"]: _build_notion_property("cantidad", results_summary.get("passed", 0)),
+            schema["fallidas_qa"]:  _build_notion_property("cantidad", results_summary.get("failed", 0)),
+            schema["costo_usd"]:    _build_notion_property("costo_usd", results_summary.get("cost_usd", 0.0)),
         }
+        # Estado opcional (si la DB lo tiene)
+        if "estado" in schema:
+            estado_val = results_summary.get("estado", "Completado")
+            # Weekly Runs usa rich_text para Estado, no select
+            notion_properties[schema["estado"]] = {"rich_text": [{"text": {"content": str(estado_val)}}]}
 
         try:
             await self._request(
@@ -242,22 +267,35 @@ def _extract_property_value(prop_data: Optional[Dict], prop_type: str) -> Any:
 
 def _build_notion_property(internal_key: str, value: Any) -> Dict[str, Any]:
     """
-    Construye la estructura de objeto Notion para Types.
-    Mapeo heurístico sencillo.
+    Construye la estructura de objeto Notion para cada tipo de propiedad.
+    Prioridad: clave específica > heurística > fallback rich_text.
     """
     if internal_key == "title":
         return {"title": [{"text": {"content": str(value)[:2000]}}]}
-    
-    elif internal_key in ["estado", "formato", "tipo"]:
+
+    # Propiedades de tipo SELECT
+    elif internal_key in ["estado", "tipo", "formato", "run_id"]:
         return {"select": {"name": str(value)}}
-        
-    elif internal_key in ["cantidad", "rating", "costo_usd", "number"]:
-        return {"number": float(value)}
-        
-    elif internal_key in ["activo"]:
+
+    # Propiedades de tipo NUMBER
+    elif internal_key in ["cantidad", "rating", "costo_usd"]:
+        try:
+            return {"number": float(value)}
+        except (TypeError, ValueError):
+            return {"number": 0.0}
+
+    # Propiedades de tipo CHECKBOX
+    elif internal_key == "activo":
         return {"checkbox": bool(value)}
-        
+
+    # Propiedades de tipo DATE
+    elif internal_key == "fecha_generacion":
+        return {"date": {"start": str(value)[:10]}}
+
+    # Fallback: RICH_TEXT para strings, listas, etc.
     else:
-        # Fallback a text / rich_text (capping en 2000 char per limite notion por blq)
-        v = str(value)[:2000]
+        if isinstance(value, list):
+            v = "\n".join(str(i) for i in value)[:2000]
+        else:
+            v = str(value)[:2000]
         return {"rich_text": [{"text": {"content": v}}]}

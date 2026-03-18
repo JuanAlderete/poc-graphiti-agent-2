@@ -6,7 +6,7 @@ FUTURO: expuesto via FastAPI POST /generate.
 import logging
 from typing import Optional
 
-from poc.agents.base_agent import ContentAgent, AgentInput, AgentOutput
+from poc.agents.base_agent import BaseAgent, AgentInput, ContentPiece
 from poc.agents.registry import get_agent
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ class GenerationService:
         context: str,
         sop: Optional[str] = None,
         **kwargs,
-    ) -> AgentOutput:
+    ) -> ContentPiece:
         """
         Args:
             formato: 'reel_cta' | 'reel_lead_magnet' | 'historia' | 'email' | 'ads'
@@ -46,11 +46,11 @@ class GenerationService:
         Returns:
             AgentOutput con campos estructurados según el formato.
         """
-        agent: ContentAgent = get_agent(formato)
+        agent: BaseAgent = get_agent(formato)
         agent_input = AgentInput(
             topic=topic,
-            context=context,
+            chunk={"content": context, "chunk_id": "manual", "document_id": "manual", "document_title": "Búsqueda híbrida"} if context else None,
             sop=sop,
             extra=kwargs,
         )
-        return await agent.run(agent_input)
+        return await agent.generate(agent_input)
